@@ -1,3 +1,5 @@
+#[cfg(feature = "eip-8142")]
+pub mod bib;
 pub mod blobs;
 pub mod client_version;
 pub mod exchange_transition_config;
