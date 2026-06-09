@@ -697,6 +697,62 @@ impl RpcHandler for GetPayloadV6Request {
     }
 }
 
+pub struct GetPayloadV7Request {
+    pub payload_id: u64,
+}
+
+impl From<GetPayloadV7Request> for RpcRequest {
+    fn from(val: GetPayloadV7Request) -> Self {
+        RpcRequest {
+            method: "engine_getPayloadV7".to_string(),
+            params: Some(vec![serde_json::json!(U256::from(val.payload_id))]),
+            ..Default::default()
+        }
+    }
+}
+
+impl RpcHandler for GetPayloadV7Request {
+    fn parse(params: &Option<Vec<Value>>) -> Result<Self, RpcErr> {
+        let payload_id = parse_get_payload_request(params)?;
+        Ok(Self { payload_id })
+    }
+
+    async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
+        let payload_bundle = get_payload(self.payload_id, &context).await?;
+        let chain_config = &context.storage.get_chain_config();
+
+        if !chain_config.is_eip8142_activated(payload_bundle.block.header.timestamp) {
+            return Err(RpcErr::UnsupportedFork(format!(
+                "{:?}",
+                chain_config.get_fork(payload_bundle.block.header.timestamp)
+            )));
+        }
+
+        // V7 carries EIP-8142 ("block-in-blobs"): the ExecutionPayload reports
+        // `payload_blob_count` (set in the header during production), and the
+        // blobs bundle already has the payload blobs prepended ahead of the
+        // type-3 transaction blobs (done in `finalize_payload`).
+        let response = ExecutionPayloadResponse {
+            execution_payload: ExecutionPayload::from_block(
+                payload_bundle.block,
+                payload_bundle.block_access_list,
+            ),
+            block_value: payload_bundle.block_value,
+            blobs_bundle: Some(payload_bundle.blobs_bundle),
+            should_override_builder: Some(false),
+            execution_requests: Some(
+                payload_bundle
+                    .requests
+                    .into_iter()
+                    .filter(|r| !r.is_empty())
+                    .collect(),
+            ),
+        };
+
+        serde_json::to_value(response).map_err(|error| RpcErr::Internal(error.to_string()))
+    }
+}
+
 pub struct GetPayloadBodiesByHashV1Request {
     pub hashes: Vec<BlockHash>,
 }
@@ -1497,6 +1553,7 @@ mod tests {
             excess_blob_gas: Some(0),
             slot_number: Some(0),
             block_access_list: Some(BlockAccessList::default()),
+            payload_blob_count: None,
         }
     }
 
@@ -1523,6 +1580,42 @@ mod tests {
         let err = validate_execution_payload_v5(&payload).unwrap_err();
 
         assert!(matches!(err, RpcErr::WrongParam(param) if param == "slot_number"));
+    }
+
+    #[test]
+    fn into_block_and_from_block_thread_payload_blob_count() {
+        let mut payload = v5_payload();
+        payload.payload_blob_count = Some(3);
+
+        let block = payload.clone().into_block(None, None, None).unwrap();
+        assert_eq!(block.header.payload_blob_count, Some(3));
+
+        let roundtrip = ExecutionPayload::from_block(block, payload.block_access_list.clone());
+        assert_eq!(roundtrip.payload_blob_count, Some(3));
+    }
+
+    #[test]
+    fn payload_blob_count_serializes_as_optional_hex() {
+        let mut payload = v5_payload();
+        payload.payload_blob_count = Some(5);
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["payloadBlobCount"], "0x5");
+
+        // Round-trips back to the same value.
+        let decoded: ExecutionPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.payload_blob_count, Some(5));
+
+        // Absent when `None` (backward-compatible with pre-V7 payloads).
+        payload.payload_blob_count = None;
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(json.get("payloadBlobCount").is_none());
+    }
+
+    #[test]
+    fn get_payload_v7_parses_payload_id() {
+        let params = Some(vec![serde_json::json!(U256::from(42u64))]);
+        let request = GetPayloadV7Request::parse(&params).unwrap();
+        assert_eq!(request.payload_id, 42);
     }
 
     #[test]
