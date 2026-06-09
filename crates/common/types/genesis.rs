@@ -269,6 +269,11 @@ pub struct ChainConfig {
     pub bpo5_time: Option<u64>,
     pub amsterdam_time: Option<u64>,
 
+    /// EIP-8142 "block-in-blobs" activation timestamp.
+    /// (configure `eip8142_time >= amsterdam_time`).
+    #[serde(default)]
+    pub eip8142_time: Option<u64>,
+
     /// Amount of total difficulty reached by the network that triggers the consensus upgrade.
     #[serde(default, with = "crate::serde_utils::u128::hex_str_opt")]
     pub terminal_total_difficulty: Option<u128>,
@@ -363,6 +368,11 @@ impl From<Fork> for &str {
 }
 
 impl ChainConfig {
+    pub fn is_eip8142_activated(&self, block_timestamp: u64) -> bool {
+        self.eip8142_time
+            .is_some_and(|time| time <= block_timestamp)
+    }
+
     pub fn is_amsterdam_activated(&self, block_timestamp: u64) -> bool {
         self.amsterdam_time
             .is_some_and(|time| time <= block_timestamp)
@@ -428,6 +438,7 @@ impl ChainConfig {
             ("Verkle", self.verkle_time),
             ("Osaka", self.osaka_time),
             ("Amsterdam", self.amsterdam_time),
+            ("EIP-8142", self.eip8142_time),
         ];
 
         let active_forks: Vec<_> = post_merge_forks

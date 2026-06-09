@@ -1,4 +1,4 @@
-//! EIP-8142 "blobs in blocks" helpers.
+//! EIP-8142 "block-in-blobs" helpers.
 //!
 //! Encode and decode the subset of an execution payload that is published via
 //! blobs (the EIP-7928 block access list and the block's transactions) to and
@@ -6,7 +6,7 @@
 //!
 //! Spec: <https://eips.ethereum.org/EIPS/eip-8142>
 
-use ethrex_common::types::{
+use crate::types::{
     BYTES_PER_BLOB, BYTES_PER_FIELD_ELEMENT, Blob, FIELD_ELEMENTS_PER_BLOB, SAFE_BYTES_PER_BLOB,
     Transaction, block_access_list::BlockAccessList,
 };
@@ -64,6 +64,17 @@ pub fn execution_payload_data_to_blobs(data: &ExecutionPayloadData) -> Vec<Blob>
     payload.extend_from_slice(&txs_bytes);
 
     bytes_to_blobs(&payload)
+}
+
+/// Number of blobs the execution-payload data (block access list + transactions)
+/// packs into, computed from the RLP-encoded lengths without materializing the
+/// blobs. Equal to `execution_payload_data_to_blobs(..).len()`.
+pub fn payload_blob_count(
+    block_access_list: &BlockAccessList,
+    transactions: &Vec<Transaction>,
+) -> u64 {
+    let len = HEADER_SIZE + block_access_list.length() + transactions.length();
+    len.div_ceil(USABLE_BYTES_PER_BLOB) as u64
 }
 
 /// Decodes blobs produced by [`execution_payload_data_to_blobs`] back into the
@@ -212,6 +223,15 @@ mod tests {
         let blobs = execution_payload_data_to_blobs(&data);
         let decoded = blobs_to_execution_payload_data(&blobs).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn payload_blob_count_matches_encoding() {
+        let data = ExecutionPayloadData::default();
+        assert_eq!(
+            payload_blob_count(&data.block_access_list, &data.transactions),
+            execution_payload_data_to_blobs(&data).len() as u64
+        );
     }
 
     #[test]
