@@ -9,6 +9,7 @@ mod constants;
 pub(crate) mod eip8025_cell;
 #[cfg(feature = "eip-8025")]
 pub mod eip8025_ssz;
+pub mod eip8142;
 mod fork_id;
 mod genesis;
 pub mod l2;

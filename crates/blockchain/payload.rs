@@ -859,6 +859,20 @@ impl Blockchain {
             block_access_list.as_ref().map(|bal| bal.compute_hash());
         context.block_access_list = block_access_list;
 
+        // Set payload blob count in block header (EIP-8142 "block-in-blobs")
+        let eip8142_active = context
+            .chain_config()
+            .is_eip8142_activated(context.payload.header.timestamp);
+        if eip8142_active {
+            if let Some(bal) = context.block_access_list.as_ref() {
+                context.payload.header.payload_blob_count =
+                    Some(ethrex_common::types::eip8142::payload_blob_count(
+                        bal,
+                        &context.payload.body.transactions,
+                    ));
+            }
+        }
+
         let mut logs = vec![];
         for receipt in context.receipts.iter().cloned() {
             for log in receipt.logs {
