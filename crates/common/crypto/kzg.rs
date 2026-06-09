@@ -266,6 +266,17 @@ pub fn blob_to_kzg_commitment(blob: &Blob) -> Result<Commitment, KzgError> {
     Ok(commitment.to_bytes().into_inner())
 }
 
+/// Computes the random-point KZG opening proof of a blob given its commitment.
+/// EIP-8142's zkVM `getPayload` variant produces these (`payload_kzg_proofs`) for
+/// the payload blobs; the zkVM `new_payload` verifies them with
+/// `verify_blob_kzg_proof_batch` instead of recomputing commitments (the MSM).
+#[cfg(feature = "c-kzg")]
+pub fn compute_blob_kzg_proof(blob: &Blob, commitment: &Commitment) -> Result<Proof, KzgError> {
+    let c_kzg_settings = c_kzg::ethereum_kzg_settings(KZG_PRECOMPUTE);
+    let proof = c_kzg_settings.compute_blob_kzg_proof(&(*blob).into(), &(*commitment).into())?;
+    Ok(proof.to_bytes().into_inner())
+}
+
 #[cfg(feature = "c-kzg")]
 pub fn blob_to_kzg_commitment_and_proof(blob: &Blob) -> Result<(Commitment, Proof), KzgError> {
     let blob: c_kzg::Blob = (*blob).into();

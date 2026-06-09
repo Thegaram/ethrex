@@ -32,6 +32,16 @@ pub struct BlobsBundle {
     pub commitments: Vec<Commitment>,
     #[serde(with = "serde_utils::bytes48::vec")]
     pub proofs: Vec<Proof>,
+    /// EIP-8142 zkVM variant: random-point KZG opening proofs for the payload
+    /// blobs (the first `payload_blob_count` entries), used as private inputs to the
+    /// zkVM `verify_blob_kzg_proof_batch`. Empty for the native getPayload response
+    /// and for type-3 transaction bundles, and not part of the p2p RLP wire.
+    #[serde(
+        with = "serde_utils::bytes48::vec",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    pub payload_kzg_proofs: Vec<Proof>,
     #[serde(skip, default)]
     pub version: u8,
 }
@@ -83,7 +93,11 @@ pub fn kzg_commitment_to_versioned_hash(data: &Commitment) -> H256 {
 /// this function. (A genuinely new proof scheme would still require changes in
 /// [`BlobsBundle::create_from_blobs`] and `verify_kzg_proofs`.)
 pub fn blob_wrapper_version(fork: crate::types::Fork) -> u8 {
-    if fork >= crate::types::Fork::Osaka { 1 } else { 0 }
+    if fork >= crate::types::Fork::Osaka {
+        1
+    } else {
+        0
+    }
 }
 
 impl BlobsBundle {
@@ -124,6 +138,7 @@ impl BlobsBundle {
             blobs: blobs.clone(),
             commitments,
             proofs,
+            payload_kzg_proofs: Vec::new(),
             version: wrapper_version.unwrap_or(0),
         })
     }
@@ -132,6 +147,27 @@ impl BlobsBundle {
         self.commitments
             .iter()
             .map(kzg_commitment_to_versioned_hash)
+            .collect()
+    }
+
+    /// Computes the EIP-8142 `payload_kzg_proofs`: random-point KZG opening proofs
+    /// for the first `payload_blob_count` blobs (the payload blobs, which are
+    /// prepended ahead of the type-3 transaction blobs), using their commitments.
+    #[cfg(feature = "c-kzg")]
+    pub fn compute_payload_kzg_proofs(
+        &self,
+        payload_blob_count: usize,
+    ) -> Result<Vec<Proof>, BlobsBundleError> {
+        if self.blobs.len() < payload_blob_count || self.commitments.len() < payload_blob_count {
+            return Err(BlobsBundleError::BlobsBundleWrongLen);
+        }
+        self.blobs[..payload_blob_count]
+            .iter()
+            .zip(&self.commitments[..payload_blob_count])
+            .map(|(blob, commitment)| {
+                ethrex_crypto::kzg::compute_blob_kzg_proof(blob, commitment)
+                    .map_err(BlobsBundleError::from)
+            })
             .collect()
     }
 
@@ -273,6 +309,9 @@ impl RLPDecode for BlobsBundle {
                 blobs,
                 commitments,
                 proofs,
+                // Not part of the p2p RLP wire; payload-blob proofs travel only in
+                // the engine/prover path.
+                payload_kzg_proofs: Vec::new(),
                 version: version.unwrap_or_default(),
             },
             decoder.finish()?,
@@ -464,6 +503,7 @@ mod tests {
                             })
                             .collect(),
                             version: 0,
+            payload_kzg_proofs: Vec::new(),
         };
 
         let tx = crate::types::transaction::EIP4844Transaction {
@@ -516,6 +556,7 @@ mod tests {
                               })
                               .collect(),
                               version: 0,
+            payload_kzg_proofs: Vec::new(),
         };
 
         let tx = crate::types::transaction::EIP4844Transaction {
@@ -615,6 +656,47 @@ mod tests {
         assert!(matches!(
             blobs_bundle.validate(&tx, crate::types::Fork::Amsterdam),
             Err(crate::types::BlobsBundleError::InvalidBlobVersionForFork)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "c-kzg")]
+    fn compute_payload_kzg_proofs_produces_verifiable_proofs() {
+        use ethrex_crypto::kzg::verify_blob_kzg_proof;
+
+        // Three blobs; the first two stand in for payload blobs, the third for a
+        // type-3 transaction blob.
+        let blobs = vec![
+            "payload blob a".as_bytes(),
+            "payload blob b".as_bytes(),
+            "type-3 blob".as_bytes(),
+        ]
+        .into_iter()
+        .map(|data| {
+            crate::types::blobs_bundle::blob_from_bytes(data.into()).expect("Failed to create blob")
+        })
+        .collect();
+        let bundle = crate::types::BlobsBundle::create_from_blobs(&blobs, Some(1))
+            .expect("Failed to create blobs bundle");
+
+        let payload_blob_count = 2;
+        let proofs = bundle
+            .compute_payload_kzg_proofs(payload_blob_count)
+            .expect("Failed to compute payload kzg proofs");
+
+        // One proof per payload blob — only the leading `payload_blob_count` blobs.
+        assert_eq!(proofs.len(), payload_blob_count);
+        for i in 0..payload_blob_count {
+            assert!(
+                verify_blob_kzg_proof(bundle.blobs[i], bundle.commitments[i], proofs[i])
+                    .expect("verification errored")
+            );
+        }
+
+        // A count past the available blobs is rejected.
+        assert!(matches!(
+            bundle.compute_payload_kzg_proofs(bundle.blobs.len() + 1),
+            Err(crate::types::BlobsBundleError::BlobsBundleWrongLen)
         ));
     }
 }

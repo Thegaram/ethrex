@@ -168,6 +168,7 @@ impl RLPxMessage for BatchSealed {
                 blobs,
                 commitments,
                 proofs,
+                payload_kzg_proofs: Vec::new(),
                 version: 0,
             },
             commit_tx,

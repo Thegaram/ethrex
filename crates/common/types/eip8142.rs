@@ -40,7 +40,9 @@ pub struct ExecutionPayloadData {
 pub enum BibError {
     #[error("blob field element {0} has a non-zero most-significant byte")]
     NonZeroPadding(usize),
-    #[error("packed payload is truncated: header declares {declared} bytes but only {available} are present")]
+    #[error(
+        "packed payload is truncated: header declares {declared} bytes but only {available} are present"
+    )]
     Truncated { declared: usize, available: usize },
     #[error("blob has non-zero trailing data after the declared payload")]
     TrailingData,
@@ -190,9 +192,7 @@ mod tests {
     #[test]
     fn bytes_blobs_round_trip_across_blob_boundary() {
         // A payload larger than one blob exercises the multi-blob path.
-        let data: Vec<u8> = (0..USABLE_BYTES_PER_BLOB + 1234)
-            .map(|i| i as u8)
-            .collect();
+        let data: Vec<u8> = (0..USABLE_BYTES_PER_BLOB + 1234).map(|i| i as u8).collect();
 
         let blobs = bytes_to_blobs(&data);
         assert_eq!(blobs.len(), 2);
