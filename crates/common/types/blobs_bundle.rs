@@ -76,6 +76,16 @@ pub fn kzg_commitment_to_versioned_hash(data: &Commitment) -> H256 {
     versioned_hash.into()
 }
 
+/// The blob "wrapper version" mandated by `fork`: `0` (blob proofs, EIP-4844)
+/// before Osaka, `1` (cell proofs, EIP-7594) on Osaka+. Centralizing the
+/// fork→version mapping keeps producers and validators in agreement, so a future
+/// fork that keeps the cell-proof scheme but bumps the version only needs to change
+/// this function. (A genuinely new proof scheme would still require changes in
+/// [`BlobsBundle::create_from_blobs`] and `verify_kzg_proofs`.)
+pub fn blob_wrapper_version(fork: crate::types::Fork) -> u8 {
+    if fork >= crate::types::Fork::Osaka { 1 } else { 0 }
+}
+
 impl BlobsBundle {
     pub fn empty() -> Self {
         Self::default()
@@ -201,9 +211,9 @@ impl BlobsBundle {
             return Err(BlobsBundleError::BlobBundleEmptyError);
         }
 
-        // The wrapper version is fork-specific: 0 (blob proofs) before Osaka, 1 (cell
-        // proofs, EIP-7594) on Osaka+. Any other value is invalid.
-        let expected_version = if fork >= Fork::Osaka { 1 } else { 0 };
+        // The wrapper version is fork-specific (blob proofs before Osaka, cell
+        // proofs on Osaka+); any other value is invalid.
+        let expected_version = blob_wrapper_version(fork);
         if self.version != expected_version {
             return Err(BlobsBundleError::InvalidBlobVersionForFork);
         }

@@ -24,6 +24,12 @@ use ethrex_common::{
     },
 };
 
+#[cfg(feature = "c-kzg")]
+use ethrex_common::types::{
+    blob_wrapper_version,
+    eip8142::{ExecutionPayloadData, execution_payload_data_to_blobs},
+};
+
 use ethrex_crypto::NativeCrypto;
 use ethrex_crypto::keccak::Keccak256;
 use ethrex_vm::{Evm, EvmError, check_2d_gas_allowance};
@@ -820,6 +826,83 @@ impl Blockchain {
         Ok(())
     }
 
+    /// EIP-8142 "block-in-blobs": encode the execution-payload data (BALs + txs)
+    /// into blobs, record their count in the header, and prepend them to the
+    /// payload's blob bundle. Payload blobs go first, ahead of the type-3 tx blobs.
+    /// 
+    /// Payload blobs and type-3 blobs share the `MAX_BLOBS_PER_BLOCK` budget. The
+    /// builder cannot reserve for them precisely during transaction selection
+    /// because the BAL (and therefore the exact count) is only known here, after
+    /// execution; exceeding the budget is logged for now (see `improvements.md`).
+    fn add_payload_blobs(&self, context: &mut PayloadBuildContext) -> Result<(), ChainError> {
+        // EIP-8142 only activates alongside the Amsterdam block access list, so a
+        // missing BAL here is a configuration error.
+        if context.block_access_list.is_none() {
+            return Err(ChainError::Custom(
+                "EIP-8142 is active but the block access list is missing \
+                 (configure eip8142_time >= amsterdam_time)"
+                    .to_string(),
+            ));
+        }
+
+        // Producing the payload blobs (and their commitments/proofs) needs a KZG
+        // backend; without `c-kzg` this node cannot serve EIP-8142 blocks, so record
+        // a zero count and return. `c-kzg` is on by default in the `ethrex` binary.
+        #[cfg(not(feature = "c-kzg"))]
+        {
+            context.payload.header.payload_blob_count = Some(0);
+            Ok(())
+        }
+
+        #[cfg(feature = "c-kzg")]
+        {
+            let block_access_list = context
+                .block_access_list
+                .clone()
+                .expect("block access list presence checked above");
+
+            let payload_data = ExecutionPayloadData {
+                block_access_list,
+                transactions: context.payload.body.transactions.clone(),
+            };
+
+            let payload_blobs = execution_payload_data_to_blobs(&payload_data);
+
+            // The header count is the number of encoded payload blobs
+            context.payload.header.payload_blob_count = Some(payload_blobs.len() as u64);
+
+            // Encode payload blob bundle (blob + commitment + proof).
+            let fork = context
+                .chain_config()
+                .get_fork(context.payload.header.timestamp);
+            let wrapper_version = blob_wrapper_version(fork);
+            let mut bundle =
+                BlobsBundle::create_from_blobs(&payload_blobs, Some(wrapper_version)).map_err(
+                    |err| {
+                        ChainError::Custom(format!("failed to build EIP-8142 payload blobs: {err}"))
+                    },
+                )?;
+
+            // Payload blobs first, then the type-3 transaction blobs already collected.
+            bundle += std::mem::take(&mut context.blobs_bundle);
+            context.blobs_bundle = bundle;
+
+            // Check blob count limit.
+            let max_blobs = self.effective_max_blobs(context);
+            if context.blobs_bundle.blobs.len() > max_blobs {
+                warn!(
+                    payload_blobs = payload_blobs.len(),
+                    total_blobs = context.blobs_bundle.blobs.len(),
+                    max_blobs,
+                    "EIP-8142: total blob count exceeds MAX_BLOBS_PER_BLOCK; builder \
+                     reservation during tx selection is a known TODO"
+                );
+            }
+
+            Ok(())
+        }
+    }
+
     pub fn finalize_payload(&self, context: &mut PayloadBuildContext) -> Result<(), ChainError> {
         // Take BAL from VM before getting state transitions (which clears state)
         let block_access_list = context.vm.take_bal();
@@ -859,18 +942,13 @@ impl Blockchain {
             block_access_list.as_ref().map(|bal| bal.compute_hash());
         context.block_access_list = block_access_list;
 
-        // Set payload blob count in block header (EIP-8142 "block-in-blobs")
-        let eip8142_active = context
+        // EIP-8142 "block-in-blobs": record the payload blob count in the header
+        // and publish the payload blobs (with commitments/proofs) in the bundle.
+        if context
             .chain_config()
-            .is_eip8142_activated(context.payload.header.timestamp);
-        if eip8142_active {
-            if let Some(bal) = context.block_access_list.as_ref() {
-                context.payload.header.payload_blob_count =
-                    Some(ethrex_common::types::eip8142::payload_blob_count(
-                        bal,
-                        &context.payload.body.transactions,
-                    ));
-            }
+            .is_eip8142_activated(context.payload.header.timestamp)
+        {
+            self.add_payload_blobs(context)?;
         }
 
         let mut logs = vec![];

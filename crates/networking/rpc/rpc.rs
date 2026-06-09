@@ -5,7 +5,8 @@ use crate::debug::execution_witness_by_hash::ExecutionWitnessByBlockHashRequest;
 use crate::engine::blobs::{BlobsV2Request, BlobsV3Request};
 use crate::engine::client_version::GetClientVersionV1Request;
 use crate::engine::payload::{
-    GetPayloadV5Request, GetPayloadV6Request, NewPayloadV5Request, NewPayloadWithWitnessV5Request,
+    GetPayloadV5Request, GetPayloadV6Request, GetPayloadV7Request, NewPayloadV5Request,
+    NewPayloadWithWitnessV5Request,
 };
 use crate::engine::{
     ExchangeCapabilitiesRequest,
@@ -1181,7 +1182,7 @@ pub async fn map_debug_requests(req: &RpcRequest, context: RpcApiContext) -> Res
 /// Handles:
 /// - Fork choice: `engine_forkchoiceUpdatedV1/V2/V3`
 /// - Payload submission: `engine_newPayloadV1/V2/V3/V4/V5`, `engine_newPayloadWithWitnessV5`
-/// - Payload retrieval: `engine_getPayloadV1/V2/V3/V4/V5/V6`
+/// - Payload retrieval: `engine_getPayloadV1/V2/V3/V4/V5/V6/V7`
 /// - Payload bodies: `engine_getPayloadBodiesByHashV1`, `engine_getPayloadBodiesByRangeV1`
 /// - Blob retrieval: `engine_getBlobsV1/V2/V3`
 /// - Capabilities: `engine_exchangeCapabilities`, `engine_exchangeTransitionConfigurationV1`
@@ -1206,6 +1207,7 @@ pub async fn map_engine_requests(
         "engine_exchangeTransitionConfigurationV1" => {
             ExchangeTransitionConfigV1Req::call(req, context).await
         }
+        "engine_getPayloadV7" => GetPayloadV7Request::call(req, context).await,
         "engine_getPayloadV6" => GetPayloadV6Request::call(req, context).await,
         "engine_getPayloadV5" => GetPayloadV5Request::call(req, context).await,
         "engine_getPayloadV4" => GetPayloadV4Request::call(req, context).await,
@@ -1518,6 +1520,7 @@ mod tests {
                             "bpo4Time": null,
                             "bpo5Time": null,
                             "amsterdamTime": null,
+                            "eip8142Time": null,
                             "terminalTotalDifficulty": "0x0",
                             "terminalTotalDifficultyPassed": true,
                             "blobSchedule": blob_schedule,

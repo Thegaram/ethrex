@@ -65,6 +65,14 @@ pub struct ExecutionPayload {
         default
     )]
     pub block_access_list: Option<BlockAccessList>,
+    // ExecutionPayloadV7 field (EIP-8142 "block-in-blobs").
+    // Optional since we support previous versions.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "serde_utils::u64::hex_str_opt",
+        default
+    )]
+    pub payload_blob_count: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +161,7 @@ impl ExecutionPayload {
             requests_hash,
             slot_number: self.slot_number,
             block_access_list_hash,
+            payload_blob_count: self.payload_blob_count,
             ..Default::default()
         };
 
@@ -185,6 +194,7 @@ impl ExecutionPayload {
             excess_blob_gas: block.header.excess_blob_gas,
             slot_number: block.header.slot_number,
             block_access_list,
+            payload_blob_count: block.header.payload_blob_count,
         }
     }
 }
