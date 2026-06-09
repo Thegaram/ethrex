@@ -48,22 +48,40 @@ pub enum BibError {
     Rlp(#[from] RLPDecodeError),
 }
 
-/// Encodes the block access list and transactions of an execution payload into
-/// blobs, prefixed with an 8-byte header holding their big-endian `u32` lengths.
-pub fn execution_payload_data_to_blobs(data: &ExecutionPayloadData) -> Vec<Blob> {
-    let bal_bytes = data.block_access_list.encode_to_vec();
-    let txs_bytes = data.transactions.encode_to_vec();
-
+/// Packs the already-encoded block access list and transactions bytes into blobs,
+/// prefixed with an 8-byte header holding their big-endian `u32` lengths.
+fn payload_parts_to_blobs(bal_bytes: &[u8], txs_bytes: &[u8]) -> Vec<Blob> {
     debug_assert!(bal_bytes.len() <= u32::MAX as usize);
     debug_assert!(txs_bytes.len() <= u32::MAX as usize);
 
     let mut payload = Vec::with_capacity(HEADER_SIZE + bal_bytes.len() + txs_bytes.len());
     payload.extend_from_slice(&(bal_bytes.len() as u32).to_be_bytes());
     payload.extend_from_slice(&(txs_bytes.len() as u32).to_be_bytes());
-    payload.extend_from_slice(&bal_bytes);
-    payload.extend_from_slice(&txs_bytes);
+    payload.extend_from_slice(bal_bytes);
+    payload.extend_from_slice(txs_bytes);
 
     bytes_to_blobs(&payload)
+}
+
+/// Encodes the block access list and transactions of an execution payload into
+/// blobs, prefixed with an 8-byte header holding their big-endian `u32` lengths.
+pub fn execution_payload_data_to_blobs(data: &ExecutionPayloadData) -> Vec<Blob> {
+    payload_parts_to_blobs(
+        &data.block_access_list.encode_to_vec(),
+        &data.transactions.encode_to_vec(),
+    )
+}
+
+/// Like [`execution_payload_data_to_blobs`], but takes the block access list as the
+/// raw RLP bytes received in the payload. Per the EIP-8142 spec, `blockAccessList`
+/// is opaque bytes, so using them verbatim avoids a decode→re-encode round-trip
+/// (and the non-canonical mismatch it could introduce). Transactions are still
+/// RLP-encoded as a list. Used by `engine_newPayload` verification.
+pub fn execution_payload_to_blobs_from_raw_bal(
+    bal_bytes: &[u8],
+    transactions: &Vec<Transaction>,
+) -> Vec<Blob> {
+    payload_parts_to_blobs(bal_bytes, &transactions.encode_to_vec())
 }
 
 /// Number of blobs the execution-payload data (block access list + transactions)

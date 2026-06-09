@@ -15,7 +15,7 @@ pub type ExchangeCapabilitiesRequest = Vec<String>;
 
 /// List of capabilities that the execution layer client supports. Add new capabilities here.
 /// More info: https://github.com/ethereum/execution-apis/blob/main/src/engine/common.md#engine_exchangecapabilities
-pub const CAPABILITIES: [&str; 26] = [
+pub const CAPABILITIES: [&str; 28] = [
     "engine_forkchoiceUpdatedV1",
     "engine_forkchoiceUpdatedV2",
     "engine_forkchoiceUpdatedV3",
@@ -26,6 +26,8 @@ pub const CAPABILITIES: [&str; 26] = [
     "engine_newPayloadV4",
     "engine_newPayloadV5",
     "engine_newPayloadWithWitnessV5",
+    "engine_newPayloadV6",
+    "engine_newPayloadWithWitnessV6",
     "engine_getPayloadV1",
     "engine_getPayloadV2",
     "engine_getPayloadV3",

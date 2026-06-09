@@ -297,6 +297,13 @@ fn verify_blob_gas_usage(block: &Block, config: &ChainConfig) -> Result<(), Inva
             blobs_in_block += tx.blob_versioned_hashes.len() as u32;
         }
     }
+    // EIP-8142: payload blobs share the MAX_BLOBS_PER_BLOCK budget with type-3
+    // transaction blobs, so count them toward the per-block blob limit. The header
+    // carries `payload_blob_count` exactly when EIP-8142 is active (the header
+    // validators, run just before this, enforce Some-iff-active), so an absent
+    // field contributes zero. Only the count is adjusted here — payload-blob
+    // blob-gas pricing is an open EIP question, left to the type-3 accounting.
+    blobs_in_block += block.header.payload_blob_count.unwrap_or(0) as u32;
     if blob_gas_used > max_blob_gas_per_block {
         return Err(InvalidBlockError::ExceededMaxBlobGasPerBlock);
     }

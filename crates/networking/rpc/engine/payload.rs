@@ -7,6 +7,14 @@ use ethrex_common::types::payload::PayloadBundle;
 use ethrex_common::types::requests::{EncodedRequests, compute_requests_hash};
 use ethrex_common::types::{Block, BlockBody, BlockHash, BlockHeader, BlockNumber, Fork};
 use ethrex_common::{H256, U256};
+// EIP-8142 native payload-blob verification (engine_newPayloadV6) needs a KZG
+// backend to compute blob commitments.
+#[cfg(feature = "c-kzg")]
+use ethrex_common::types::{
+    eip8142::execution_payload_to_blobs_from_raw_bal, kzg_commitment_to_versioned_hash,
+};
+#[cfg(feature = "c-kzg")]
+use ethrex_crypto::kzg::blob_to_kzg_commitment;
 use ethrex_p2p::sync::SyncMode;
 use ethrex_rlp::{decode::RLPDecode, error::RLPDecodeError, structs::Encoder};
 use serde_json::Value;
@@ -389,6 +397,16 @@ impl NewPayloadV5Request {
             )));
         }
 
+        // EIP-8142-active timestamps must use V6, not V5 — V6 carries
+        // `payload_blob_count` and verifies the payload blobs. Symmetric with the
+        // pre-Amsterdam→V4 case above.
+        if chain_config.is_eip8142_activated(block.header.timestamp) {
+            return Err(RpcErr::UnsupportedFork(format!(
+                "{:?}",
+                chain_config.get_fork(block.header.timestamp)
+            )));
+        }
+
         // EIP-7928 fork-boundary detector: V5 requires block_access_list_hash in
         // the header. If the payload's block_hash matches what a V4-style header
         // (without the field) would produce, the sender used the wrong API
@@ -443,6 +461,157 @@ impl From<NewPayloadWithWitnessV5Request> for RpcRequest {
 impl RpcHandler for NewPayloadWithWitnessV5Request {
     fn parse(params: &Option<Vec<Value>>) -> Result<Self, RpcErr> {
         NewPayloadV5Request::parse(params).map(Self)
+    }
+
+    async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
+        self.0.handle_with_witness(context, true).await
+    }
+}
+
+pub struct NewPayloadV6Request {
+    pub payload: ExecutionPayload,
+    pub expected_blob_versioned_hashes: Vec<H256>,
+    pub parent_beacon_block_root: H256,
+    pub execution_requests: Vec<EncodedRequests>,
+    /// The block access list as the raw RLP bytes received in the payload. Kept
+    /// verbatim (not just its hash) because EIP-8142 derives the payload blobs from
+    /// these exact bytes; its keccak is also the header's `block_access_list_hash`.
+    pub raw_bal: Option<Bytes>,
+}
+
+impl From<NewPayloadV6Request> for RpcRequest {
+    fn from(val: NewPayloadV6Request) -> Self {
+        RpcRequest {
+            method: "engine_newPayloadV6".to_string(),
+            params: Some(vec![
+                serde_json::json!(val.payload),
+                serde_json::json!(val.expected_blob_versioned_hashes),
+                serde_json::json!(val.parent_beacon_block_root),
+                serde_json::json!(val.execution_requests),
+            ]),
+            ..Default::default()
+        }
+    }
+}
+
+impl RpcHandler for NewPayloadV6Request {
+    fn parse(params: &Option<Vec<Value>>) -> Result<Self, RpcErr> {
+        let params = params
+            .as_ref()
+            .ok_or(RpcErr::BadParams("No params provided".to_owned()))?;
+        if params.len() != 4 {
+            return Err(RpcErr::BadParams("Expected 4 params".to_owned()));
+        }
+
+        // Keep the raw BAL bytes as-received: EIP-8142 encodes the payload blobs
+        // from them, and their keccak is the header's block_access_list_hash.
+        let raw_bal = params[0]
+            .get("blockAccessList")
+            .map(|v| {
+                let hex_str = v
+                    .as_str()
+                    .ok_or(RpcErr::WrongParam("blockAccessList".to_string()))?;
+                let bytes = hex::decode(hex_str.trim_start_matches("0x"))
+                    .map_err(|_| RpcErr::WrongParam("blockAccessList".to_string()))?;
+                Ok::<_, RpcErr>(Bytes::from(bytes))
+            })
+            .transpose()?;
+
+        Ok(Self {
+            payload: serde_json::from_value(params[0].clone())
+                .map_err(|_| RpcErr::WrongParam("payload".to_string()))?,
+            expected_blob_versioned_hashes: serde_json::from_value(params[1].clone())
+                .map_err(|_| RpcErr::WrongParam("expected_blob_versioned_hashes".to_string()))?,
+            parent_beacon_block_root: serde_json::from_value(params[2].clone())
+                .map_err(|_| RpcErr::WrongParam("parent_beacon_block_root".to_string()))?,
+            execution_requests: serde_json::from_value(params[3].clone())
+                .map_err(|_| RpcErr::WrongParam("execution_requests".to_string()))?,
+            raw_bal,
+        })
+    }
+
+    async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
+        self.handle_with_witness(context, false).await
+    }
+}
+
+impl NewPayloadV6Request {
+    async fn handle_with_witness(
+        &self,
+        context: RpcApiContext,
+        make_witness: bool,
+    ) -> Result<Value, RpcErr> {
+        validate_execution_payload_v6(&self.payload)?;
+
+        // validate the received requests
+        validate_execution_requests(&self.execution_requests)?;
+
+        let requests_hash = compute_requests_hash(&self.execution_requests);
+        // The header's BAL hash is the keccak of the raw RLP bytes as-received,
+        // preserving the exact encoding for the block hash check.
+        let block_access_list_hash = self.raw_bal.as_ref().map(ethrex_common::utils::keccak);
+
+        let block = match get_block_from_payload(
+            &self.payload,
+            Some(self.parent_beacon_block_root),
+            Some(requests_hash),
+            block_access_list_hash,
+        ) {
+            Ok(block) => block,
+            Err(err) => {
+                return Ok(serde_json::to_value(PayloadStatus::invalid_with_err(
+                    &err.to_string(),
+                ))?);
+            }
+        };
+
+        let chain_config = context.storage.get_chain_config();
+
+        // V6 is the EIP-8142 method; pre-EIP-8142 timestamps must use V5. (EIP-8142
+        // requires Amsterdam — `eip8142_time >= amsterdam_time` — so this also
+        // implies Amsterdam.)
+        if !chain_config.is_eip8142_activated(block.header.timestamp) {
+            return Err(RpcErr::UnsupportedFork(format!(
+                "{:?}",
+                chain_config.get_fork(block.header.timestamp)
+            )));
+        }
+
+        let bal = self.payload.block_access_list.clone();
+        let payload_status = handle_new_payload_v6(
+            &self.payload,
+            context,
+            block,
+            self.expected_blob_versioned_hashes.clone(),
+            bal,
+            self.raw_bal.clone(),
+            make_witness,
+        )
+        .await?;
+        serde_json::to_value(payload_status).map_err(|error| RpcErr::Internal(error.to_string()))
+    }
+}
+
+pub struct NewPayloadWithWitnessV6Request(pub NewPayloadV6Request);
+
+impl From<NewPayloadWithWitnessV6Request> for RpcRequest {
+    fn from(val: NewPayloadWithWitnessV6Request) -> Self {
+        RpcRequest {
+            method: "engine_newPayloadWithWitnessV6".to_string(),
+            params: Some(vec![
+                serde_json::json!(val.0.payload),
+                serde_json::json!(val.0.expected_blob_versioned_hashes),
+                serde_json::json!(val.0.parent_beacon_block_root),
+                serde_json::json!(val.0.execution_requests),
+            ]),
+            ..Default::default()
+        }
+    }
+}
+
+impl RpcHandler for NewPayloadWithWitnessV6Request {
+    fn parse(params: &Option<Vec<Value>>) -> Result<Self, RpcErr> {
+        NewPayloadV6Request::parse(params).map(Self)
     }
 
     async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
@@ -1045,6 +1214,18 @@ fn validate_execution_payload_v5(payload: &ExecutionPayload) -> Result<(), RpcEr
     Ok(())
 }
 
+#[inline]
+fn validate_execution_payload_v6(payload: &ExecutionPayload) -> Result<(), RpcErr> {
+    // EIP-8142: same structure as V5 plus the `payload_blob_count` header field.
+    validate_execution_payload_v5(payload)?;
+
+    if payload.payload_blob_count.is_none() {
+        return Err(RpcErr::WrongParam("payload_blob_count".to_string()));
+    }
+
+    Ok(())
+}
+
 fn validate_payload_v1_v2(block: &Block, context: &RpcApiContext) -> Result<(), RpcErr> {
     let chain_config = &context.storage.get_chain_config();
     if chain_config.is_cancun_activated(block.header.timestamp) {
@@ -1175,6 +1356,98 @@ async fn handle_new_payload_v4(
         make_witness,
     )
     .await
+}
+
+async fn handle_new_payload_v6(
+    payload: &ExecutionPayload,
+    context: RpcApiContext,
+    block: Block,
+    expected_blob_versioned_hashes: Vec<H256>,
+    bal: Option<BlockAccessList>,
+    raw_bal: Option<Bytes>,
+    make_witness: bool,
+) -> Result<PayloadStatus, RpcErr> {
+    // V4's block access list ordering check still applies.
+    if let Some(bal) = &bal
+        && let Err(err) = bal.validate_ordering()
+    {
+        return Ok(PayloadStatus::invalid_with_err(&err));
+    }
+
+    // EIP-8142: verify the payload blob count and the combined versioned hashes
+    // (payload blobs first, then type-3). This replaces V3's type-3-only check.
+    if let Some(status) =
+        verify_eip8142_payload(&block, raw_bal.as_deref(), &expected_blob_versioned_hashes)?
+    {
+        return Ok(status);
+    }
+
+    handle_new_payload_v1_v2(payload, block, context, bal, make_witness).await
+}
+
+/// EIP-8142 native verification: re-derive the payload blobs from the block access
+/// list bytes and transactions, check the header's `payload_blob_count` equals the
+/// number of payload blobs, and check `expected_blob_versioned_hashes` equals the
+/// payload-blob versioned hashes followed by the type-3 transaction blob hashes.
+///
+/// Returns `Ok(None)` when valid, `Ok(Some(invalid_status))` when a check fails, or
+/// `Err` on an internal/KZG error. Computing the commitments needs the `c-kzg`
+/// feature; without it the native variant is unavailable (the zkVM variant verifies
+/// via proof openings instead — see `improvements.md`).
+#[cfg(feature = "c-kzg")]
+fn verify_eip8142_payload(
+    block: &Block,
+    raw_bal: Option<&[u8]>,
+    expected_blob_versioned_hashes: &[H256],
+) -> Result<Option<PayloadStatus>, RpcErr> {
+    let Some(raw_bal) = raw_bal else {
+        return Ok(Some(PayloadStatus::invalid_with_err(
+            "EIP-8142 payload missing block access list",
+        )));
+    };
+
+    let payload_blobs =
+        execution_payload_to_blobs_from_raw_bal(raw_bal, &block.body.transactions);
+
+    if block.header.payload_blob_count != Some(payload_blobs.len() as u64) {
+        return Ok(Some(PayloadStatus::invalid_with_err(
+            "Invalid payload_blob_count",
+        )));
+    }
+
+    // payload-blob versioned hashes first, then type-3 transaction blob hashes.
+    let mut actual = Vec::with_capacity(payload_blobs.len());
+    for blob in &payload_blobs {
+        let commitment = blob_to_kzg_commitment(blob)
+            .map_err(|err| RpcErr::Internal(format!("KZG commitment failed: {err}")))?;
+        actual.push(kzg_commitment_to_versioned_hash(&commitment));
+    }
+    actual.extend(
+        block
+            .body
+            .transactions
+            .iter()
+            .flat_map(|tx| tx.blob_versioned_hashes()),
+    );
+
+    if expected_blob_versioned_hashes != actual.as_slice() {
+        return Ok(Some(PayloadStatus::invalid_with_err(
+            "Invalid blob_versioned_hashes",
+        )));
+    }
+
+    Ok(None)
+}
+
+#[cfg(not(feature = "c-kzg"))]
+fn verify_eip8142_payload(
+    _block: &Block,
+    _raw_bal: Option<&[u8]>,
+    _expected_blob_versioned_hashes: &[H256],
+) -> Result<Option<PayloadStatus>, RpcErr> {
+    Err(RpcErr::Internal(
+        "engine_newPayloadV6 (EIP-8142) requires the c-kzg feature".to_string(),
+    ))
 }
 
 // Elements of the list MUST be ordered by request_type in ascending order.
@@ -1598,6 +1871,35 @@ mod tests {
         let params = Some(vec![serde_json::json!(U256::from(42u64))]);
         let request = GetPayloadV7Request::parse(&params).unwrap();
         assert_eq!(request.payload_id, 42);
+    }
+
+    #[test]
+    fn new_payload_v6_rejects_missing_payload_blob_count() {
+        let mut payload = v5_payload();
+        payload.payload_blob_count = None;
+
+        let err = validate_execution_payload_v6(&payload).unwrap_err();
+
+        assert!(matches!(err, RpcErr::WrongParam(param) if param == "payload_blob_count"));
+    }
+
+    #[test]
+    fn new_payload_v6_parses_and_keeps_raw_bal() {
+        let mut payload = v5_payload();
+        payload.payload_blob_count = Some(1);
+
+        let params = Some(vec![
+            serde_json::json!(payload),
+            serde_json::json!(Vec::<H256>::new()),
+            serde_json::json!(H256::zero()),
+            serde_json::json!(Vec::<EncodedRequests>::new()),
+        ]);
+
+        let request = NewPayloadV6Request::parse(&params).unwrap();
+
+        assert_eq!(request.payload.payload_blob_count, Some(1));
+        // The raw block access list bytes are retained for EIP-8142 blob encoding.
+        assert!(request.raw_bal.is_some());
     }
 
     #[test]
