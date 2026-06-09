@@ -880,13 +880,39 @@ impl From<GetPayloadV7Request> for RpcRequest {
     }
 }
 
-impl RpcHandler for GetPayloadV7Request {
-    fn parse(params: &Option<Vec<Value>>) -> Result<Self, RpcErr> {
-        let payload_id = parse_get_payload_request(params)?;
-        Ok(Self { payload_id })
+/// Builds the EIP-8142 getPayload response: the `ExecutionPayload` (reporting
+/// `payload_blob_count`, set in the header during production) and the blobs bundle,
+/// which already has the payload blobs prepended ahead of the type-3 transaction
+/// blobs (done in `finalize_payload`). Shared by the native (V7) and zk variants.
+fn build_eip8142_payload_response(payload_bundle: PayloadBundle) -> ExecutionPayloadResponse {
+    ExecutionPayloadResponse {
+        execution_payload: ExecutionPayload::from_block(
+            payload_bundle.block,
+            payload_bundle.block_access_list,
+        ),
+        block_value: payload_bundle.block_value,
+        blobs_bundle: Some(payload_bundle.blobs_bundle),
+        should_override_builder: Some(false),
+        execution_requests: Some(
+            payload_bundle
+                .requests
+                .into_iter()
+                .filter(|r| !r.is_empty())
+                .collect(),
+        ),
     }
+}
 
-    async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
+impl GetPayloadV7Request {
+    /// Shared handler for the native getPayload (V7) and the with-KZG-proofs variant.
+    /// `with_kzg_proofs` attaches the EIP-8142 payload-blob random-point proofs to the
+    /// bundle (zkVM `new_payload` private inputs) — the only difference between the two
+    /// responses, mirroring how `make_witness` is the only difference for newPayload.
+    async fn handle_inner(
+        &self,
+        context: RpcApiContext,
+        with_kzg_proofs: bool,
+    ) -> Result<Value, RpcErr> {
         let payload_bundle = get_payload(self.payload_id, &context).await?;
         let chain_config = &context.storage.get_chain_config();
 
@@ -897,28 +923,89 @@ impl RpcHandler for GetPayloadV7Request {
             )));
         }
 
-        // V7 carries EIP-8142 ("block-in-blobs"): the ExecutionPayload reports
-        // `payload_blob_count` (set in the header during production), and the
-        // blobs bundle already has the payload blobs prepended ahead of the
-        // type-3 transaction blobs (done in `finalize_payload`).
-        let response = ExecutionPayloadResponse {
-            execution_payload: ExecutionPayload::from_block(
-                payload_bundle.block,
-                payload_bundle.block_access_list,
-            ),
-            block_value: payload_bundle.block_value,
-            blobs_bundle: Some(payload_bundle.blobs_bundle),
-            should_override_builder: Some(false),
-            execution_requests: Some(
-                payload_bundle
-                    .requests
-                    .into_iter()
-                    .filter(|r| !r.is_empty())
-                    .collect(),
-            ),
-        };
+        let mut response = build_eip8142_payload_response(payload_bundle);
+
+        if with_kzg_proofs {
+            attach_payload_kzg_proofs(&mut response)?;
+        }
 
         serde_json::to_value(response).map_err(|error| RpcErr::Internal(error.to_string()))
+    }
+}
+
+impl RpcHandler for GetPayloadV7Request {
+    fn parse(params: &Option<Vec<Value>>) -> Result<Self, RpcErr> {
+        let payload_id = parse_get_payload_request(params)?;
+        Ok(Self { payload_id })
+    }
+
+    async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
+        self.handle_inner(context, false).await
+    }
+}
+
+/// Attaches the EIP-8142 payload-blob random-point proofs (`payload_kzg_proofs`) to
+/// the response's bundle — one per payload blob (the leading `payload_blob_count`
+/// blobs). Computing them needs a KZG backend.
+#[cfg(feature = "c-kzg")]
+fn attach_payload_kzg_proofs(response: &mut ExecutionPayloadResponse) -> Result<(), RpcErr> {
+    // The caller has verified EIP-8142 is active, so the produced block must carry
+    // `payload_blob_count`; its absence here is a production bug, not a missing input.
+    let payload_blob_count = response
+        .execution_payload
+        .payload_blob_count
+        .ok_or_else(|| {
+            RpcErr::Internal(
+                "EIP-8142 is active but the produced block has no payload_blob_count".to_string(),
+            )
+        })? as usize;
+    if let Some(bundle) = response.blobs_bundle.as_mut() {
+        let proofs = bundle
+            .compute_payload_kzg_proofs(payload_blob_count)
+            .map_err(|err| {
+                RpcErr::Internal(format!("failed to compute payload_kzg_proofs: {err}"))
+            })?;
+        bundle.payload_kzg_proofs = proofs;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "c-kzg"))]
+fn attach_payload_kzg_proofs(_response: &mut ExecutionPayloadResponse) -> Result<(), RpcErr> {
+    Err(RpcErr::Internal(
+        "getPayload with KZG proofs (EIP-8142) requires the c-kzg feature".to_string(),
+    ))
+}
+
+/// EIP-8142 zkVM-optimized `engine_getPayload` (`get_payload_zk`): the native V7
+/// response plus the payload-blob random-point proofs (`payload_kzg_proofs`) attached
+/// to the bundle, used as private inputs for the zkVM `new_payload` consistency check
+/// (`verify_blob_kzg_proof_batch`). Wraps [`GetPayloadV7Request`], the same way
+/// [`NewPayloadWithWitnessV5Request`] wraps its base request.
+///
+/// **Intentionally not wired into `CAPABILITIES`/`map_engine_requests`.** These proofs
+/// are prover inputs, not CL-facing data — ethrex feeds its prover via the
+/// witness/`ProgramInput` path, not getPayload. This is the engine-API-shaped builder
+/// for that flow, kept ready for future interop but unexposed for now.
+pub struct GetPayloadWithKzgProofsV7Request(pub GetPayloadV7Request);
+
+impl From<GetPayloadWithKzgProofsV7Request> for RpcRequest {
+    fn from(val: GetPayloadWithKzgProofsV7Request) -> Self {
+        RpcRequest {
+            method: "engine_getPayloadWithKzgProofsV7".to_string(),
+            params: Some(vec![serde_json::json!(U256::from(val.0.payload_id))]),
+            ..Default::default()
+        }
+    }
+}
+
+impl RpcHandler for GetPayloadWithKzgProofsV7Request {
+    fn parse(params: &Option<Vec<Value>>) -> Result<Self, RpcErr> {
+        GetPayloadV7Request::parse(params).map(Self)
+    }
+
+    async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
+        self.0.handle_inner(context, true).await
     }
 }
 
@@ -1406,8 +1493,7 @@ fn verify_eip8142_payload(
         )));
     };
 
-    let payload_blobs =
-        execution_payload_to_blobs_from_raw_bal(raw_bal, &block.body.transactions);
+    let payload_blobs = execution_payload_to_blobs_from_raw_bal(raw_bal, &block.body.transactions);
 
     if block.header.payload_blob_count != Some(payload_blobs.len() as u64) {
         return Ok(Some(PayloadStatus::invalid_with_err(

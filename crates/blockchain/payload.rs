@@ -829,7 +829,7 @@ impl Blockchain {
     /// EIP-8142 "block-in-blobs": encode the execution-payload data (BALs + txs)
     /// into blobs, record their count in the header, and prepend them to the
     /// payload's blob bundle. Payload blobs go first, ahead of the type-3 tx blobs.
-    /// 
+    ///
     /// Payload blobs and type-3 blobs share the `MAX_BLOBS_PER_BLOCK` budget. The
     /// builder cannot reserve for them precisely during transaction selection
     /// because the BAL (and therefore the exact count) is only known here, after
@@ -876,12 +876,10 @@ impl Blockchain {
                 .chain_config()
                 .get_fork(context.payload.header.timestamp);
             let wrapper_version = blob_wrapper_version(fork);
-            let mut bundle =
-                BlobsBundle::create_from_blobs(&payload_blobs, Some(wrapper_version)).map_err(
-                    |err| {
-                        ChainError::Custom(format!("failed to build EIP-8142 payload blobs: {err}"))
-                    },
-                )?;
+            let mut bundle = BlobsBundle::create_from_blobs(&payload_blobs, Some(wrapper_version))
+                .map_err(|err| {
+                    ChainError::Custom(format!("failed to build EIP-8142 payload blobs: {err}"))
+                })?;
 
             // Payload blobs first, then the type-3 transaction blobs already collected.
             bundle += std::mem::take(&mut context.blobs_bundle);

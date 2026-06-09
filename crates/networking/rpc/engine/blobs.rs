@@ -223,6 +223,7 @@ mod tests {
             blobs,
             commitments,
             proofs,
+            payload_kzg_proofs: Vec::new(),
             version: 1,
         };
         (bundle, hashes)
