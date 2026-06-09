@@ -6,7 +6,7 @@ use crate::engine::blobs::{BlobsV2Request, BlobsV3Request};
 use crate::engine::client_version::GetClientVersionV1Request;
 use crate::engine::payload::{
     GetPayloadV5Request, GetPayloadV6Request, GetPayloadV7Request, NewPayloadV5Request,
-    NewPayloadWithWitnessV5Request,
+    NewPayloadV6Request, NewPayloadWithWitnessV5Request, NewPayloadWithWitnessV6Request,
 };
 use crate::engine::{
     ExchangeCapabilitiesRequest,
@@ -1181,7 +1181,7 @@ pub async fn map_debug_requests(req: &RpcRequest, context: RpcApiContext) -> Res
 ///
 /// Handles:
 /// - Fork choice: `engine_forkchoiceUpdatedV1/V2/V3`
-/// - Payload submission: `engine_newPayloadV1/V2/V3/V4/V5`, `engine_newPayloadWithWitnessV5`
+/// - Payload submission: `engine_newPayloadV1/V2/V3/V4/V5/V6`, `engine_newPayloadWithWitnessV5`
 /// - Payload retrieval: `engine_getPayloadV1/V2/V3/V4/V5/V6/V7`
 /// - Payload bodies: `engine_getPayloadBodiesByHashV1`, `engine_getPayloadBodiesByRangeV1`
 /// - Blob retrieval: `engine_getBlobsV1/V2/V3`
@@ -1203,6 +1203,10 @@ pub async fn map_engine_requests(
         // they live on the heap instead of inflating the stack frame that even a
         // lightweight `forkchoiceUpdated` poll must reserve — otherwise a single
         // poll overflows the 2 MB tokio worker stack in unoptimized debug builds.
+        "engine_newPayloadV6" => Box::pin(NewPayloadV6Request::call(req, context)).await,
+        "engine_newPayloadWithWitnessV6" => {
+            Box::pin(NewPayloadWithWitnessV6Request::call(req, context)).await
+        }
         "engine_newPayloadWithWitnessV5" => {
             Box::pin(NewPayloadWithWitnessV5Request::call(req, context)).await
         }

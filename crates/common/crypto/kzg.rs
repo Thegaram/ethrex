@@ -255,6 +255,17 @@ pub fn verify_kzg_proof(
     }
 }
 
+/// Computes the KZG commitment of a blob (commitment only, no proof). Native
+/// EIP-8142 `engine_newPayload` derives the payload-blob versioned hashes from
+/// these commitments.
+#[cfg(feature = "c-kzg")]
+pub fn blob_to_kzg_commitment(blob: &Blob) -> Result<Commitment, KzgError> {
+    let blob: c_kzg::Blob = (*blob).into();
+    let c_kzg_settings = c_kzg::ethereum_kzg_settings(KZG_PRECOMPUTE);
+    let commitment = c_kzg::KzgSettings::blob_to_kzg_commitment(c_kzg_settings, &blob)?;
+    Ok(commitment.to_bytes().into_inner())
+}
+
 #[cfg(feature = "c-kzg")]
 pub fn blob_to_kzg_commitment_and_proof(blob: &Blob) -> Result<(Commitment, Proof), KzgError> {
     let blob: c_kzg::Blob = (*blob).into();
