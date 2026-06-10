@@ -543,6 +543,51 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
             .map_err(|e| CryptoError::Other(e.to_string()))
     }
 
+    /// Verify a batch of blob KZG proofs
+    /// (consensus-specs `verify_blob_kzg_proof_batch`)
+    /// Used by EIP-8142 "block-in-blobs" for payload-blob verification.
+    #[cfg(feature = "c-kzg")]
+    fn verify_blob_kzg_proof_batch(
+        &self,
+        blobs: &[[u8; crate::kzg::BYTES_PER_BLOB]],
+        commitments: &[[u8; 48]],
+        proofs: &[[u8; 48]],
+    ) -> Result<bool, CryptoError> {
+        if blobs.len() != commitments.len() || blobs.len() != proofs.len() {
+            return Err(CryptoError::InvalidInput(
+                "blobs, commitments and proofs must have the same length",
+            ));
+        }
+        // Simply delegate to the underlying c-kzg implementation.
+        crate::kzg::verify_kzg_proof_batch(blobs, commitments, proofs)
+            .map_err(|e| CryptoError::Other(e.to_string()))
+    }
+
+    /// Loops over `verify_blob_kzg_proof`, so this works where the backend
+    /// has a blob-level KZG library (kzg-rs on SP1) and surfaces the
+    /// underlying `Unimplemented` error on OpenVM/Zisk. Universal backend
+    /// support (point-evaluation reduction) and a true batched verification
+    /// are future improvements.
+    #[cfg(not(feature = "c-kzg"))]
+    fn verify_blob_kzg_proof_batch(
+        &self,
+        blobs: &[[u8; crate::kzg::BYTES_PER_BLOB]],
+        commitments: &[[u8; 48]],
+        proofs: &[[u8; 48]],
+    ) -> Result<bool, CryptoError> {
+        if blobs.len() != commitments.len() || blobs.len() != proofs.len() {
+            return Err(CryptoError::InvalidInput(
+                "blobs, commitments and proofs must have the same length",
+            ));
+        }
+        for ((blob, commitment), proof) in blobs.iter().zip(commitments).zip(proofs) {
+            if !self.verify_blob_kzg_proof(blob, commitment, proof)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     // ── BLS12-381 (Prague, EIP-2537) ───────────────────────────────────
 
     /// G1 addition. Returns 96-byte unpadded G1 point.
@@ -819,4 +864,54 @@ fn serialize_bls12_g2(point: &bls12_381::G2Affine) -> Result<[u8; 192], CryptoEr
     out[96..144].copy_from_slice(&raw[144..192]); // y_0
     out[144..192].copy_from_slice(&raw[96..144]); // y_1
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic blob: small integers in big-endian (always canonical),
+    /// with its c-kzg-generated commitment and opening proof.
+    fn test_blob() -> [u8; crate::kzg::BYTES_PER_BLOB] {
+        let mut blob = [0u8; crate::kzg::BYTES_PER_BLOB];
+        for i in 0..crate::kzg::FIELD_ELEMENTS_PER_BLOB {
+            let value = (i as u64).wrapping_mul(0x0101).wrapping_add(7);
+            let start = i * crate::kzg::BYTES_PER_FIELD_ELEMENT + 24;
+            blob[start..start + 8].copy_from_slice(&value.to_be_bytes());
+        }
+        blob
+    }
+
+    const COMMITMENT: [u8; 48] = hex_literal::hex!(
+        "954b338068a20effb2f9fca295010786508dce908f464125f47f3e9aac031b54df77bca2eebdc7df6f4202570c56c8bd"
+    );
+    const PROOF: [u8; 48] = hex_literal::hex!(
+        "b6140e33b1beca81d58618a6fbe7dda0b490d25d4f2712cd7fa66334be057d091b58f72024baa4cd916973543772df44"
+    );
+
+    /// EIP-8142 payload-blob verification goes through the batch entry point
+    /// (c-kzg default: real c-kzg batch; otherwise: single-blob loop, kzg-rs
+    /// in the default test config). Check a real opening verifies, an
+    /// invalid (but well-formed) proof maps to `Ok(false)`, and mismatched
+    /// input lengths error.
+    #[test]
+    fn verify_blob_kzg_proof_batch_verifies_real_openings() {
+        let blobs = vec![test_blob()];
+        assert!(
+            crate::NativeCrypto
+                .verify_blob_kzg_proof_batch(&blobs, &[COMMITMENT], &[PROOF])
+                .unwrap()
+        );
+        // The commitment is a valid G1 point but not the opening proof.
+        assert!(
+            !crate::NativeCrypto
+                .verify_blob_kzg_proof_batch(&blobs, &[COMMITMENT], &[COMMITMENT])
+                .unwrap()
+        );
+        assert!(
+            crate::NativeCrypto
+                .verify_blob_kzg_proof_batch(&blobs, &[], &[])
+                .is_err()
+        );
+    }
 }

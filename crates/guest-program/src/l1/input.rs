@@ -40,6 +40,9 @@ impl ProgramInput {
 /// `Direct` carries in-memory blocks + witness (test path). `Wire` carries an
 /// already-decoded EIP-8025 stateless input from spec wire bytes.
 #[cfg(feature = "eip-8025")]
+// One value exists per program run, so the variant size gap is immaterial
+// and boxing would only complicate the `Wire(...)` pattern matches.
+#[allow(clippy::large_enum_variant)]
 pub enum ProgramInput {
     Direct {
         blocks: Vec<Block>,
@@ -81,6 +84,10 @@ pub const EIP8025_VERSION_LEGACY: u8 = 0x00;
 /// Wire-format version byte for the canonical EIP-8025 framing.
 #[cfg(feature = "eip-8025")]
 pub const EIP8025_VERSION_CANONICAL: u8 = 0x01;
+
+/// Wire-format version byte for the EIP-8142 (Block-in-Blobs) framing.
+#[cfg(feature = "eip-8025")]
+pub const EIP8025_VERSION_BIB: u8 = 0x02;
 
 /// Encode a `NewPayloadRequest` (SSZ) and `ExecutionWitness` (rkyv) into the
 /// legacy EIP-8025 length-prefixed wire format:
@@ -204,6 +211,35 @@ pub struct CanonicalStatelessInput {
     pub public_keys: PublicKeysList,
 }
 
+/// [`CanonicalStatelessInput`] extended for EIP-8142 (Block-in-Blobs). The
+/// request's payload carries `payload_blob_count`; the commitments and
+/// random-point opening proofs for the payload blobs ride here as *private*
+/// prover inputs (like `public_keys`), outside the hash-tree-rooted request —
+/// the request's versioned hashes pin the commitments, and the proofs let the
+/// guest verify payload blobs as openings instead of recomputing commitments
+/// via an MSM (the EIP's `new_payload_zk` variant).
+#[cfg(feature = "eip-8025")]
+#[derive(Debug, Clone, PartialEq, Eq, libssz_derive::SszEncode, libssz_derive::SszDecode)]
+pub struct BibStatelessInput {
+    pub new_payload_request: ethrex_common::types::eip8025_ssz::NewPayloadRequestBib,
+    pub witness: CanonicalExecutionWitness,
+    pub chain_config: CanonicalChainConfig,
+    /// Per-transaction public keys (uncompressed secp256k1, 65 bytes each).
+    pub public_keys: PublicKeysList,
+    /// KZG commitments to the payload blobs — the first `payload_blob_count`
+    /// blob commitments referenced by the block.
+    pub payload_kzg_commitments: libssz_types::SszList<
+        [u8; 48],
+        { ethrex_common::types::eip8025_ssz::MAX_BLOB_COMMITMENTS_PER_BLOCK },
+    >,
+    /// Random-point KZG opening proofs for the payload blobs, one per
+    /// commitment (the bundle's `payload_kzg_proofs`).
+    pub payload_kzg_proofs: libssz_types::SszList<
+        [u8; 48],
+        { ethrex_common::types::eip8025_ssz::MAX_BLOB_COMMITMENTS_PER_BLOCK },
+    >,
+}
+
 /// Decoded EIP-8025 wire payload, dispatched by version byte.
 #[cfg(feature = "eip-8025")]
 pub enum DecodedEip8025 {
@@ -217,6 +253,11 @@ pub enum DecodedEip8025 {
         stateless_input: CanonicalStatelessInput,
         chain_config: ethrex_common::types::ChainConfig,
     },
+    /// EIP-8142 Block-in-Blobs framing (`version = 0x02`).
+    Bib {
+        stateless_input: BibStatelessInput,
+        chain_config: ethrex_common::types::ChainConfig,
+    },
 }
 
 #[cfg(feature = "eip-8025")]
@@ -225,6 +266,7 @@ impl core::fmt::Debug for DecodedEip8025 {
         match self {
             DecodedEip8025::Legacy { .. } => f.write_str("DecodedEip8025::Legacy"),
             DecodedEip8025::Canonical { .. } => f.write_str("DecodedEip8025::Canonical"),
+            DecodedEip8025::Bib { .. } => f.write_str("DecodedEip8025::Bib"),
         }
     }
 }
@@ -236,6 +278,8 @@ impl core::fmt::Debug for DecodedEip8025 {
 ///   (`[ssz_len: u32 LE] [ssz_bytes] [rkyv ExecutionWitness]`).
 /// - `0x01` → canonical-input framing
 ///   (`[ssz_len: u32 LE] [ssz_bytes] [cfg_len: u32 LE] [rkyv ChainConfig]`).
+/// - `0x02` → Block-in-Blobs framing (same layout as `0x01`, the SSZ bytes
+///   are a [`BibStatelessInput`]).
 ///
 /// Anything else surfaces as [`ProgramInputDecodeError::UnknownVersion`].
 #[cfg(feature = "eip-8025")]
@@ -252,8 +296,15 @@ pub fn decode_eip8025(bytes: &[u8]) -> Result<DecodedEip8025, ProgramInputDecode
             })
         }
         EIP8025_VERSION_CANONICAL => {
-            let (stateless_input, chain_config) = decode_eip8025_canonical(rest)?;
+            let (stateless_input, chain_config) = decode_eip8025_frame(rest)?;
             Ok(DecodedEip8025::Canonical {
+                stateless_input,
+                chain_config,
+            })
+        }
+        EIP8025_VERSION_BIB => {
+            let (stateless_input, chain_config) = decode_eip8025_frame(rest)?;
+            Ok(DecodedEip8025::Bib {
                 stateless_input,
                 chain_config,
             })
@@ -314,12 +365,13 @@ fn decode_eip8025_legacy(
     Ok((new_payload_request, execution_witness))
 }
 
+/// Decode a `[ssz_len: u32 LE] [ssz_bytes] [cfg_len: u32 LE] [rkyv ChainConfig]`
+/// frame (canonical and BiB layouts) into its SSZ stateless input and chain
+/// config.
 #[cfg(feature = "eip-8025")]
-fn decode_eip8025_canonical(
+fn decode_eip8025_frame<T: libssz::SszDecode>(
     bytes: &[u8],
-) -> Result<(CanonicalStatelessInput, ethrex_common::types::ChainConfig), ProgramInputDecodeError> {
-    use libssz::SszDecode;
-
+) -> Result<(T, ethrex_common::types::ChainConfig), ProgramInputDecodeError> {
     if bytes.len() < 4 {
         return Err(ProgramInputDecodeError::TooShort);
     }
@@ -347,12 +399,10 @@ fn decode_eip8025_canonical(
     }
     let cfg_bytes = &bytes[cfg_off..cfg_end];
 
-    let stateless_input =
-        CanonicalStatelessInput::from_ssz_bytes(ssz_bytes).map_err(ProgramInputDecodeError::Ssz)?;
+    let stateless_input = T::from_ssz_bytes(ssz_bytes).map_err(ProgramInputDecodeError::Ssz)?;
     let chain_config =
         rkyv::from_bytes::<ethrex_common::types::ChainConfig, rkyv::rancor::Error>(cfg_bytes)
             .map_err(|e| ProgramInputDecodeError::Rkyv(e.to_string()))?;
-
     Ok((stateless_input, chain_config))
 }
 
@@ -392,6 +442,98 @@ impl core::fmt::Display for ProgramInputDecodeError {
             Self::UnknownSchemaId(v) => {
                 write!(f, "unknown stateless input schema id: {v:#06x}")
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "eip-8025"))]
+mod tests {
+    use super::*;
+    use ethrex_common::types::eip8025_ssz::{
+        Bytes20, ExecutionPayloadV5, ExecutionRequests, NewPayloadRequestBib,
+    };
+
+    fn sample_bib_stateless_input() -> BibStatelessInput {
+        let execution_payload = ExecutionPayloadV5 {
+            parent_hash: [1u8; 32],
+            fee_recipient: Bytes20([2u8; 20]),
+            state_root: [3u8; 32],
+            receipts_root: [4u8; 32],
+            logs_bloom: vec![0u8; 256].try_into().expect("logs_bloom length"),
+            prev_randao: [5u8; 32],
+            block_number: 42,
+            gas_limit: 30_000_000,
+            gas_used: 21_000,
+            timestamp: 1_700_000_000,
+            extra_data: vec![].try_into().expect("extra_data fits"),
+            base_fee_per_gas: [0u8; 32],
+            block_hash: [6u8; 32],
+            transactions: vec![].try_into().expect("txs fit"),
+            withdrawals: vec![].try_into().expect("withdrawals fit"),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: vec![0xC0].try_into().expect("bal fits"),
+            slot_number: 7,
+            payload_blob_count: 1,
+        };
+        BibStatelessInput {
+            new_payload_request: NewPayloadRequestBib {
+                execution_payload,
+                versioned_hashes: vec![[9u8; 32]].try_into().expect("hashes fit"),
+                parent_beacon_block_root: [8u8; 32],
+                execution_requests: ExecutionRequests {
+                    deposits: vec![].try_into().expect("empty deposits"),
+                    withdrawals: vec![].try_into().expect("empty withdrawals"),
+                    consolidations: vec![].try_into().expect("empty consolidations"),
+                },
+            },
+            witness: CanonicalExecutionWitness {
+                state: vec![].try_into().expect("empty state"),
+                codes: vec![].try_into().expect("empty codes"),
+                headers: vec![].try_into().expect("empty headers"),
+            },
+            chain_config: CanonicalChainConfig {
+                chain_id: 1,
+                active_fork: CanonicalForkConfig {
+                    fork: 0,
+                    activation: CanonicalForkActivation {
+                        block_number: vec![].try_into().expect("empty"),
+                        timestamp: vec![].try_into().expect("empty"),
+                    },
+                    blob_schedule: vec![].try_into().expect("empty schedule"),
+                },
+            },
+            public_keys: vec![].try_into().expect("empty public keys"),
+            payload_kzg_commitments: vec![[0x11u8; 48]].try_into().expect("one commitment"),
+            payload_kzg_proofs: vec![[0x22u8; 48]].try_into().expect("one proof"),
+        }
+    }
+
+    #[test]
+    fn decode_eip8025_bib_wire_roundtrip() {
+        use libssz::SszEncode;
+
+        let stateless_input = sample_bib_stateless_input();
+        let ssz_bytes = stateless_input.to_ssz();
+        let cfg_bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&ethrex_common::types::ChainConfig::default())
+                .expect("chain config serializes");
+
+        let mut wire = vec![EIP8025_VERSION_BIB];
+        wire.extend((ssz_bytes.len() as u32).to_le_bytes());
+        wire.extend_from_slice(&ssz_bytes);
+        wire.extend((cfg_bytes.len() as u32).to_le_bytes());
+        wire.extend_from_slice(&cfg_bytes);
+
+        match decode_eip8025(&wire).expect("wire decodes") {
+            DecodedEip8025::Bib {
+                stateless_input: decoded,
+                chain_config,
+            } => {
+                assert_eq!(decoded, stateless_input);
+                assert_eq!(chain_config, ethrex_common::types::ChainConfig::default());
+            }
+            other => panic!("expected Bib variant, got {other:?}"),
         }
     }
 }

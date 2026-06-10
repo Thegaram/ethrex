@@ -29,7 +29,8 @@ const MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD: usize = 16;
 /// `MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD` (Electra).
 const MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD: usize = 2;
 /// `MAX_BLOB_COMMITMENTS_PER_BLOCK` (Electra).
-const MAX_BLOB_COMMITMENTS_PER_BLOCK: usize = 4096;
+/// EIP-8142: Also limits the payload-blob KZG commitment/proof lists in the stateless input.
+pub const MAX_BLOB_COMMITMENTS_PER_BLOCK: usize = 4096;
 /// `MAX_BLOCK_ACCESS_LIST_BYTES` (Amsterdam).
 const MAX_BLOCK_ACCESS_LIST_BYTES: usize = 16777216;
 
@@ -196,6 +197,35 @@ pub struct ExecutionPayloadV4 {
     pub slot_number: u64,
 }
 
+/// SSZ `ExecutionPayload` for EIP-8142 (Block-in-Blobs): the Amsterdam
+/// payload plus the `payload_blob_count` field the EIP appends to the CL
+/// `ExecutionPayload` container.
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+pub struct ExecutionPayloadV5 {
+    pub parent_hash: [u8; 32],
+    pub fee_recipient: Bytes20,
+    pub state_root: [u8; 32],
+    pub receipts_root: [u8; 32],
+    pub logs_bloom: LogsBloom,
+    pub prev_randao: [u8; 32],
+    pub block_number: u64,
+    pub gas_limit: u64,
+    pub gas_used: u64,
+    pub timestamp: u64,
+    pub extra_data: SszList<u8, MAX_EXTRA_DATA_BYTES>,
+    /// `base_fee_per_gas` encoded as a 256-bit unsigned integer (little-endian).
+    pub base_fee_per_gas: [u8; 32],
+    pub block_hash: [u8; 32],
+    pub transactions: SszList<SszList<u8, MAX_BYTES_PER_TRANSACTION>, MAX_TRANSACTIONS_PER_PAYLOAD>,
+    pub withdrawals: SszList<Withdrawal, MAX_WITHDRAWALS_PER_PAYLOAD>,
+    pub blob_gas_used: u64,
+    pub excess_blob_gas: u64,
+    pub block_access_list: SszList<u8, MAX_BLOCK_ACCESS_LIST_BYTES>,
+    pub slot_number: u64,
+    /// `[New in EIP8142]` Number of payload blobs.
+    pub payload_blob_count: u64,
+}
+
 // ── ExecutionRequests ──────────────────────────────────────────────
 
 /// SSZ `ExecutionRequests` container (Electra) — the typed EIP-7685 bundle
@@ -254,6 +284,20 @@ pub struct NewPayloadRequest {
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
 pub struct NewPayloadRequestAmsterdam {
     pub execution_payload: ExecutionPayloadV4,
+    pub versioned_hashes: SszList<[u8; 32], MAX_BLOB_COMMITMENTS_PER_BLOCK>,
+    pub parent_beacon_block_root: [u8; 32],
+    pub execution_requests: ExecutionRequests,
+}
+
+/// SSZ `NewPayloadRequest` for EIP-8142 (Block-in-Blobs). The payload's
+/// `payload_blob_count` marks the first `versioned_hashes` entries as
+/// payload-blob hashes; the rest belong to type-3 transactions. The
+/// payload-blob KZG commitments and opening proofs are *not* part of this
+/// container (and so not of its hash-tree-root): they are private prover
+/// inputs, carried alongside it in the stateless input like `public_keys`.
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+pub struct NewPayloadRequestBib {
+    pub execution_payload: ExecutionPayloadV5,
     pub versioned_hashes: SszList<[u8; 32], MAX_BLOB_COMMITMENTS_PER_BLOCK>,
     pub parent_beacon_block_root: [u8; 32],
     pub execution_requests: ExecutionRequests,
@@ -360,6 +404,52 @@ mod tests {
         let root1 = request.hash_tree_root(&HASHER);
         let root2 = request.hash_tree_root(&HASHER);
         assert_eq!(root1, root2, "Same request must produce same root");
+    }
+
+    #[test]
+    fn test_bib_request_roundtrip_and_root_binds_payload_blob_count() {
+        use libssz::{SszDecode, SszEncode};
+
+        let payload = sample_payload();
+        let bib_payload = ExecutionPayloadV5 {
+            parent_hash: payload.parent_hash,
+            fee_recipient: payload.fee_recipient,
+            state_root: payload.state_root,
+            receipts_root: payload.receipts_root,
+            logs_bloom: payload.logs_bloom.clone(),
+            prev_randao: payload.prev_randao,
+            block_number: payload.block_number,
+            gas_limit: payload.gas_limit,
+            gas_used: payload.gas_used,
+            timestamp: payload.timestamp,
+            extra_data: payload.extra_data.clone(),
+            base_fee_per_gas: payload.base_fee_per_gas,
+            block_hash: payload.block_hash,
+            transactions: payload.transactions.clone(),
+            withdrawals: payload.withdrawals.clone(),
+            blob_gas_used: payload.blob_gas_used,
+            excess_blob_gas: payload.excess_blob_gas,
+            block_access_list: vec![0xAA, 0xBB].try_into().expect("bal fits"),
+            slot_number: 9,
+            payload_blob_count: 2,
+        };
+        let request = NewPayloadRequestBib {
+            execution_payload: bib_payload,
+            versioned_hashes: vec![[1u8; 32], [2u8; 32]].try_into().expect("hashes fit"),
+            parent_beacon_block_root: [8u8; 32],
+            execution_requests: empty_requests(),
+        };
+
+        let decoded = NewPayloadRequestBib::from_ssz_bytes(&request.to_ssz()).expect("roundtrip");
+        assert_eq!(decoded, request);
+
+        let mut other = request.clone();
+        other.execution_payload.payload_blob_count = 3;
+        assert_ne!(
+            request.hash_tree_root(&HASHER),
+            other.hash_tree_root(&HASHER),
+            "payload_blob_count must be bound by the request root"
+        );
     }
 
     #[test]
