@@ -104,34 +104,41 @@ pub fn payload_blob_count(
 /// unpacked bytes, or non-zero trailing data after the declared payload.
 pub fn blobs_to_execution_payload_data(blobs: &[Blob]) -> Result<ExecutionPayloadData, BibError> {
     let raw = blobs_to_bytes(blobs)?;
-    if raw.len() < HEADER_SIZE {
-        return Err(BibError::Truncated {
-            declared: HEADER_SIZE,
-            available: raw.len(),
-        });
-    }
 
-    let bal_length = u32::from_be_bytes(raw[0..LENGTH_PREFIX_SIZE].try_into().unwrap()) as usize;
-    let txs_length =
-        u32::from_be_bytes(raw[LENGTH_PREFIX_SIZE..HEADER_SIZE].try_into().unwrap()) as usize;
+    let truncated = |declared: usize| BibError::Truncated {
+        declared,
+        available: raw.len(),
+    };
+    let Some((bal_length_bytes, rest)) = raw.split_first_chunk::<LENGTH_PREFIX_SIZE>() else {
+        return Err(truncated(HEADER_SIZE));
+    };
+    let bal_length = u32::from_be_bytes(*bal_length_bytes) as usize;
 
-    let bal_start = HEADER_SIZE;
-    let txs_start = bal_start + bal_length;
-    let txs_end = txs_start + txs_length;
-    if raw.len() < txs_end {
-        return Err(BibError::Truncated {
-            declared: txs_end,
-            available: raw.len(),
-        });
-    }
+    let Some((txs_length_bytes, rest)) = rest.split_first_chunk::<LENGTH_PREFIX_SIZE>() else {
+        return Err(truncated(HEADER_SIZE));
+    };
+    let txs_length = u32::from_be_bytes(*txs_length_bytes) as usize;
+
+    // The declared size can overflow `usize` on 32-bit (zkVM) targets for
+    // adversarial headers. Saturating here is for the error message only.
+    let declared_total = HEADER_SIZE
+        .saturating_add(bal_length)
+        .saturating_add(txs_length);
+
+    let Some((bal_bytes, rest)) = rest.split_at_checked(bal_length) else {
+        return Err(truncated(declared_total));
+    };
+    let block_access_list = BlockAccessList::decode(bal_bytes)?;
+
+    let Some((txs_bytes, padding)) = rest.split_at_checked(txs_length) else {
+        return Err(truncated(declared_total));
+    };
+    let transactions = Vec::<Transaction>::decode(txs_bytes)?;
 
     // Everything after the declared payload must be zero padding.
-    if raw[txs_end..].iter().any(|&b| b != 0) {
+    if padding.iter().any(|&b| b != 0) {
         return Err(BibError::TrailingData);
     }
-
-    let block_access_list = BlockAccessList::decode(&raw[bal_start..txs_start])?;
-    let transactions = Vec::<Transaction>::decode(&raw[txs_start..txs_end])?;
 
     Ok(ExecutionPayloadData {
         block_access_list,
