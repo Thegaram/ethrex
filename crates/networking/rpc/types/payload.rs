@@ -65,7 +65,7 @@ pub struct ExecutionPayload {
         default
     )]
     pub block_access_list: Option<BlockAccessList>,
-    // ExecutionPayloadV7 field (EIP-8142 "block-in-blobs").
+    // ExecutionPayloadV7 field for EIP-8142 "block-in-blobs".
     // Optional since we support previous versions.
     #[serde(
         skip_serializing_if = "Option::is_none",

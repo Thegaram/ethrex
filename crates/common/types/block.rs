@@ -155,6 +155,7 @@ pub struct BlockHeader {
         default = "Option::default"
     )]
     pub slot_number: Option<u64>,
+    // EIP-8142 "block-in-blobs" fields
     #[serde(
         skip_serializing_if = "Option::is_none",
         with = "crate::serde_utils::u64::hex_str_opt",
@@ -929,6 +930,72 @@ pub fn calc_excess_blob_gas(parent: &BlockHeader, schedule: ForkBlobSchedule, fo
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// EIP-8142: `payload_blob_count` is RLP trailing-optional — `None` leaves the
+    /// encoding (and so the block hash) unchanged; `Some` round-trips and changes
+    /// the hash.
+    #[test]
+    fn payload_blob_count_header_rlp_round_trip() {
+        // Trailing-optional RLP positions fields by presence, so all preceding
+        // optionals must be populated (as on any real post-Amsterdam header).
+        let base = BlockHeader {
+            base_fee_per_gas: Some(7),
+            withdrawals_root: Some(H256::zero()),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(H256::zero()),
+            requests_hash: Some(H256::zero()),
+            block_access_list_hash: Some(H256::zero()),
+            slot_number: Some(1),
+            ..Default::default()
+        };
+        let decoded = BlockHeader::decode(&base.encode_to_vec()).unwrap();
+        assert_eq!(decoded.payload_blob_count, None);
+
+        let with_count = BlockHeader {
+            payload_blob_count: Some(3),
+            ..base.clone()
+        };
+        let decoded = BlockHeader::decode(&with_count.encode_to_vec()).unwrap();
+        assert_eq!(decoded.payload_blob_count, Some(3));
+
+        assert_ne!(base.hash(), with_count.hash());
+    }
+
+    /// EIP-8142: the header carries `payload_blob_count` iff the fork is active.
+    #[test]
+    fn prague_header_validator_enforces_payload_blob_count_iff_active() {
+        let parent = BlockHeader::default();
+        let header = |count| BlockHeader {
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(H256::zero()),
+            requests_hash: Some(*crate::constants::DEFAULT_REQUESTS_HASH),
+            payload_blob_count: count,
+            ..Default::default()
+        };
+        let config = |eip8142_time| ChainConfig {
+            cancun_time: Some(0),
+            prague_time: Some(0),
+            eip8142_time,
+            ..Default::default()
+        };
+
+        let active = config(Some(0));
+        assert!(validate_prague_header_fields(&header(Some(1)), &parent, &active).is_ok());
+        assert!(matches!(
+            validate_prague_header_fields(&header(None), &parent, &active),
+            Err(InvalidBlockHeaderError::PayloadBlobCountNotPresent)
+        ));
+
+        let inactive = config(None);
+        assert!(validate_prague_header_fields(&header(None), &parent, &inactive).is_ok());
+        assert!(matches!(
+            validate_prague_header_fields(&header(Some(1)), &parent, &inactive),
+            Err(InvalidBlockHeaderError::PayloadBlobCountPresent)
+        ));
+    }
+
     use crate::constants::EMPTY_KECCAK_HASH;
     use crate::types::{BLOB_BASE_FEE_UPDATE_FRACTION, ELASTICITY_MULTIPLIER};
     use ethereum_types::H160;

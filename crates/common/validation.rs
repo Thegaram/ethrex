@@ -297,17 +297,14 @@ fn verify_blob_gas_usage(block: &Block, config: &ChainConfig) -> Result<(), Inva
             blobs_in_block += tx.blob_versioned_hashes.len() as u32;
         }
     }
-    // EIP-8142: payload blobs share the MAX_BLOBS_PER_BLOCK budget with type-3
-    // transaction blobs, so count them toward the per-block blob limit. The header
-    // carries `payload_blob_count` exactly when EIP-8142 is active (the header
-    // validators, run just before this, enforce Some-iff-active), so an absent
-    // field contributes zero. Only the count is adjusted here — payload-blob
-    // blob-gas pricing is an open EIP question, left to the type-3 accounting.
-    blobs_in_block += block.header.payload_blob_count.unwrap_or(0) as u32;
     if blob_gas_used > max_blob_gas_per_block {
         return Err(InvalidBlockError::ExceededMaxBlobGasPerBlock);
     }
-    if blobs_in_block > max_blob_number_per_block {
+    // EIP-8142 "block-in-blobs": Consider both payload blobs and user (type-3) blobs
+    // for the blob count limit.
+    let payload_blob_count = block.header.payload_blob_count.unwrap_or(0); // >0 iff activated
+    let total_blobs_in_block = payload_blob_count.saturating_add(u64::from(blobs_in_block));
+    if total_blobs_in_block > u64::from(max_blob_number_per_block) {
         return Err(InvalidBlockError::ExceededMaxBlobNumberPerBlock);
     }
     if block
@@ -339,4 +336,57 @@ fn verify_transaction_max_gas_limit(block: &Block) -> Result<(), InvalidBlockErr
 /// Calculates the blob gas required by a transaction.
 pub fn get_total_blob_gas(tx: &EIP4844Transaction) -> u32 {
     GAS_PER_BLOB * tx.blob_versioned_hashes.len() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Block, BlockBody, BlockHeader};
+
+    /// EIP-8142: payload blobs count toward the per-block blob limit.
+    #[test]
+    fn verify_blob_gas_usage_combined_limit_boundary() {
+        let config = ChainConfig {
+            cancun_time: Some(0),
+            ..Default::default()
+        };
+        // Default cancun schedule: max = 6 blobs. No type-3 txs in the body, so
+        // the payload count alone drives the check.
+        let block_with_count = |count| {
+            let header = BlockHeader {
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                payload_blob_count: Some(count),
+                ..Default::default()
+            };
+            Block::new(header, BlockBody::default())
+        };
+        assert!(verify_blob_gas_usage(&block_with_count(6), &config).is_ok());
+        assert!(matches!(
+            verify_blob_gas_usage(&block_with_count(7), &config),
+            Err(InvalidBlockError::ExceededMaxBlobNumberPerBlock)
+        ));
+    }
+
+    /// EIP-8142: `payload_blob_count` is an attacker-controlled u64 header field;
+    /// a value like 2^32 (which a `u32` narrowing would truncate to 0) must still
+    /// trip the per-block blob limit.
+    #[test]
+    fn verify_blob_gas_usage_rejects_oversized_payload_blob_count() {
+        let config = ChainConfig {
+            cancun_time: Some(0),
+            ..Default::default()
+        };
+        let header = BlockHeader {
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            payload_blob_count: Some(1 << 32),
+            ..Default::default()
+        };
+        let block = Block::new(header, BlockBody::default());
+        assert!(matches!(
+            verify_blob_gas_usage(&block, &config),
+            Err(InvalidBlockError::ExceededMaxBlobNumberPerBlock)
+        ));
+    }
 }

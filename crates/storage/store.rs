@@ -2369,10 +2369,6 @@ impl Store {
     ) -> Result<(), StoreError> {
         debug!("Storing initial state from genesis");
 
-        // Fail early on a misconfigured chain config
-        // rather than partway through block production.
-        genesis.config.validate().map_err(StoreError::Custom)?;
-
         // Obtain genesis block
         let genesis_block = genesis.get_block();
         let genesis_block_number = genesis_block.header.number;

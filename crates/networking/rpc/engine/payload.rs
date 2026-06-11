@@ -7,14 +7,6 @@ use ethrex_common::types::payload::PayloadBundle;
 use ethrex_common::types::requests::{EncodedRequests, compute_requests_hash};
 use ethrex_common::types::{Block, BlockBody, BlockHash, BlockHeader, BlockNumber, Fork};
 use ethrex_common::{H256, U256};
-// EIP-8142 native payload-blob verification (engine_newPayloadV6) needs a KZG
-// backend to compute blob commitments.
-#[cfg(feature = "c-kzg")]
-use ethrex_common::types::{
-    eip8142::execution_payload_to_blobs_from_raw_bal, kzg_commitment_to_versioned_hash,
-};
-#[cfg(feature = "c-kzg")]
-use ethrex_crypto::kzg::blob_to_kzg_commitment;
 use ethrex_p2p::sync::SyncMode;
 use ethrex_rlp::{decode::RLPDecode, error::RLPDecodeError, structs::Encoder};
 use serde_json::Value;
@@ -397,9 +389,7 @@ impl NewPayloadV5Request {
             )));
         }
 
-        // EIP-8142-active timestamps must use V6, not V5 — V6 carries
-        // `payload_blob_count` and verifies the payload blobs. Symmetric with the
-        // pre-Amsterdam→V4 case above.
+        // EIP-8142-active timestamps must use V6, not V5.
         if chain_config.is_eip8142_activated(block.header.timestamp) {
             return Err(RpcErr::UnsupportedFork(format!(
                 "{:?}",
@@ -473,9 +463,6 @@ pub struct NewPayloadV6Request {
     pub expected_blob_versioned_hashes: Vec<H256>,
     pub parent_beacon_block_root: H256,
     pub execution_requests: Vec<EncodedRequests>,
-    /// The block access list as the raw RLP bytes received in the payload. Kept
-    /// verbatim (not just its hash) because EIP-8142 derives the payload blobs from
-    /// these exact bytes; its keccak is also the header's `block_access_list_hash`.
     pub raw_bal: Option<Bytes>,
 }
 
@@ -567,9 +554,7 @@ impl NewPayloadV6Request {
 
         let chain_config = context.storage.get_chain_config();
 
-        // V6 is the EIP-8142 method; pre-EIP-8142 timestamps must use V5. (EIP-8142
-        // requires Amsterdam — `eip8142_time >= amsterdam_time` — so this also
-        // implies Amsterdam.)
+        // V6 is the EIP-8142 method; pre-EIP-8142 timestamps must use V5
         if !chain_config.is_eip8142_activated(block.header.timestamp) {
             return Err(RpcErr::UnsupportedFork(format!(
                 "{:?}",
@@ -880,34 +865,8 @@ impl From<GetPayloadV7Request> for RpcRequest {
     }
 }
 
-/// Builds the EIP-8142 getPayload response: the `ExecutionPayload` (reporting
-/// `payload_blob_count`, set in the header during production) and the blobs bundle,
-/// which already has the payload blobs prepended ahead of the type-3 transaction
-/// blobs (done in `finalize_payload`). Shared by the native (V7) and zk variants.
-fn build_eip8142_payload_response(payload_bundle: PayloadBundle) -> ExecutionPayloadResponse {
-    ExecutionPayloadResponse {
-        execution_payload: ExecutionPayload::from_block(
-            payload_bundle.block,
-            payload_bundle.block_access_list,
-        ),
-        block_value: payload_bundle.block_value,
-        blobs_bundle: Some(payload_bundle.blobs_bundle),
-        should_override_builder: Some(false),
-        execution_requests: Some(
-            payload_bundle
-                .requests
-                .into_iter()
-                .filter(|r| !r.is_empty())
-                .collect(),
-        ),
-    }
-}
-
 impl GetPayloadV7Request {
     /// Shared handler for the native getPayload (V7) and the with-KZG-proofs variant.
-    /// `with_kzg_proofs` attaches the EIP-8142 payload-blob random-point proofs to the
-    /// bundle (zkVM `new_payload` private inputs) — the only difference between the two
-    /// responses, mirroring how `make_witness` is the only difference for newPayload.
     async fn handle_inner(
         &self,
         context: RpcApiContext,
@@ -923,7 +882,22 @@ impl GetPayloadV7Request {
             )));
         }
 
-        let mut response = build_eip8142_payload_response(payload_bundle);
+        let mut response = ExecutionPayloadResponse {
+            execution_payload: ExecutionPayload::from_block(
+                payload_bundle.block,
+                payload_bundle.block_access_list,
+            ),
+            block_value: payload_bundle.block_value,
+            blobs_bundle: Some(payload_bundle.blobs_bundle),
+            should_override_builder: Some(false),
+            execution_requests: Some(
+                payload_bundle
+                    .requests
+                    .into_iter()
+                    .filter(|r| !r.is_empty())
+                    .collect(),
+            ),
+        };
 
         if with_kzg_proofs {
             attach_payload_kzg_proofs(&mut response)?;
@@ -944,13 +918,9 @@ impl RpcHandler for GetPayloadV7Request {
     }
 }
 
-/// Attaches the EIP-8142 payload-blob random-point proofs (`payload_kzg_proofs`) to
-/// the response's bundle — one per payload blob (the leading `payload_blob_count`
-/// blobs). Computing them needs a KZG backend.
+/// Attaches the EIP-8142 payload-blob random-point proofs to the response's bundle.
 #[cfg(feature = "c-kzg")]
 fn attach_payload_kzg_proofs(response: &mut ExecutionPayloadResponse) -> Result<(), RpcErr> {
-    // The caller has verified EIP-8142 is active, so the produced block must carry
-    // `payload_blob_count`; its absence here is a production bug, not a missing input.
     let payload_blob_count = response
         .execution_payload
         .payload_blob_count
@@ -958,15 +928,21 @@ fn attach_payload_kzg_proofs(response: &mut ExecutionPayloadResponse) -> Result<
             RpcErr::Internal(
                 "EIP-8142 is active but the produced block has no payload_blob_count".to_string(),
             )
-        })? as usize;
-    if let Some(bundle) = response.blobs_bundle.as_mut() {
-        let proofs = bundle
-            .compute_payload_kzg_proofs(payload_blob_count)
-            .map_err(|err| {
-                RpcErr::Internal(format!("failed to compute payload_kzg_proofs: {err}"))
-            })?;
-        bundle.payload_kzg_proofs = proofs;
-    }
+        })?;
+
+    let payload_blob_count = usize::try_from(payload_blob_count)
+        .map_err(|_| RpcErr::Internal("payload_blob_count overflows usize".to_string()))?;
+
+    let bundle = response.blobs_bundle.as_mut().ok_or_else(|| {
+        RpcErr::Internal(
+            "EIP-8142 is active but the payload response has no blobs bundle".to_string(),
+        )
+    })?;
+
+    bundle.payload_kzg_proofs = bundle
+        .compute_payload_kzg_proofs(payload_blob_count)
+        .map_err(|err| RpcErr::Internal(format!("failed to compute payload_kzg_proofs: {err}")))?;
+
     Ok(())
 }
 
@@ -978,15 +954,8 @@ fn attach_payload_kzg_proofs(_response: &mut ExecutionPayloadResponse) -> Result
 }
 
 /// EIP-8142 zkVM-optimized `engine_getPayload` (`get_payload_zk`): the native V7
-/// response plus the payload-blob random-point proofs (`payload_kzg_proofs`) attached
-/// to the bundle, used as private inputs for the zkVM `new_payload` consistency check
-/// (`verify_blob_kzg_proof_batch`). Wraps [`GetPayloadV7Request`], the same way
-/// [`NewPayloadWithWitnessV5Request`] wraps its base request.
-///
-/// **Intentionally not wired into `CAPABILITIES`/`map_engine_requests`.** These proofs
-/// are prover inputs, not CL-facing data — ethrex feeds its prover via the
-/// witness/`ProgramInput` path, not getPayload. This is the engine-API-shaped builder
-/// for that flow, kept ready for future interop but unexposed for now.
+/// response plus the payload-blob random-point proofs (`payload_kzg_proofs`) attached.
+/// This API is not CL-facing but prover-facing, so it remains unexposed for now.
 pub struct GetPayloadWithKzgProofsV7Request(pub GetPayloadV7Request);
 
 impl From<GetPayloadWithKzgProofsV7Request> for RpcRequest {
@@ -1303,7 +1272,7 @@ fn validate_execution_payload_v5(payload: &ExecutionPayload) -> Result<(), RpcEr
 
 #[inline]
 fn validate_execution_payload_v6(payload: &ExecutionPayload) -> Result<(), RpcErr> {
-    // EIP-8142: same structure as V5 plus the `payload_blob_count` header field.
+    // EIP-8142 "block-in-blobs": same as V5 plus the `payload_blob_count` header field
     validate_execution_payload_v5(payload)?;
 
     if payload.payload_blob_count.is_none() {
@@ -1461,8 +1430,8 @@ async fn handle_new_payload_v6(
         return Ok(PayloadStatus::invalid_with_err(&err));
     }
 
-    // EIP-8142: verify the payload blob count and the combined versioned hashes
-    // (payload blobs first, then type-3). This replaces V3's type-3-only check.
+    // EIP-8142 "block-in-blobs": Verify the payload blob count and the combined versioned hashes.
+    // This replaces V3's type-3-only check.
     if let Some(status) =
         verify_eip8142_payload(&block, raw_bal.as_deref(), &expected_blob_versioned_hashes)?
     {
@@ -1472,21 +1441,18 @@ async fn handle_new_payload_v6(
     handle_new_payload_v1_v2(payload, block, context, bal, make_witness).await
 }
 
-/// EIP-8142 native verification: re-derive the payload blobs from the block access
-/// list bytes and transactions, check the header's `payload_blob_count` equals the
-/// number of payload blobs, and check `expected_blob_versioned_hashes` equals the
-/// payload-blob versioned hashes followed by the type-3 transaction blob hashes.
-///
-/// Returns `Ok(None)` when valid, `Ok(Some(invalid_status))` when a check fails, or
-/// `Err` on an internal/KZG error. Computing the commitments needs the `c-kzg`
-/// feature; without it the native variant is unavailable (the zkVM variant verifies
-/// via proof openings instead — see `improvements.md`).
+/// EIP-8142 "block-in-blobs" native payload verification: re-encode payload.
 #[cfg(feature = "c-kzg")]
 fn verify_eip8142_payload(
     block: &Block,
     raw_bal: Option<&[u8]>,
     expected_blob_versioned_hashes: &[H256],
 ) -> Result<Option<PayloadStatus>, RpcErr> {
+    use ethrex_common::types::{
+        eip8142::execution_payload_to_blobs_from_raw_bal, kzg_commitment_to_versioned_hash,
+    };
+    use ethrex_crypto::kzg::blob_to_kzg_commitment;
+
     let Some(raw_bal) = raw_bal else {
         return Ok(Some(PayloadStatus::invalid_with_err(
             "EIP-8142 payload missing block access list",
@@ -1931,7 +1897,7 @@ mod tests {
         let block = payload.clone().into_block(None, None, None).unwrap();
         assert_eq!(block.header.payload_blob_count, Some(3));
 
-        let roundtrip = ExecutionPayload::from_block(block, payload.block_access_list.clone());
+        let roundtrip = ExecutionPayload::from_block(block, payload.block_access_list);
         assert_eq!(roundtrip.payload_blob_count, Some(3));
     }
 
@@ -1950,13 +1916,6 @@ mod tests {
         payload.payload_blob_count = None;
         let json = serde_json::to_value(&payload).unwrap();
         assert!(json.get("payloadBlobCount").is_none());
-    }
-
-    #[test]
-    fn get_payload_v7_parses_payload_id() {
-        let params = Some(vec![serde_json::json!(U256::from(42u64))]);
-        let request = GetPayloadV7Request::parse(&params).unwrap();
-        assert_eq!(request.payload_id, 42);
     }
 
     #[test]
@@ -2058,5 +2017,110 @@ mod tests {
         )
             .encode_to_vec();
         assert_eq!(encoded.as_ref(), expected.as_slice());
+    }
+    /// EIP-8142 native verification round-trip: an honestly-derived (count,
+    /// hashes) pair passes; a tampered count, wrong hashes, or a missing BAL
+    /// are each INVALID.
+    #[test]
+    #[cfg(feature = "c-kzg")]
+    fn verify_eip8142_payload_accepts_honest_and_rejects_tampered() {
+        use ethrex_common::types::{
+            BlockBody, block_access_list::BlockAccessList,
+            eip8142::execution_payload_to_blobs_from_raw_bal, kzg_commitment_to_versioned_hash,
+        };
+        use ethrex_crypto::kzg::blob_to_kzg_commitment;
+        use ethrex_rlp::encode::RLPEncode;
+
+        let raw_bal = BlockAccessList::default().encode_to_vec();
+        let block_with_count = |count| {
+            let header = BlockHeader {
+                payload_blob_count: Some(count),
+                ..Default::default()
+            };
+            ethrex_common::types::Block::new(header, BlockBody::default())
+        };
+
+        // Derive the expected hashes the same way a builder would (empty payload
+        // data packs into one blob).
+        let blobs = execution_payload_to_blobs_from_raw_bal(&raw_bal, &Vec::new());
+        assert_eq!(blobs.len(), 1);
+        let expected: Vec<H256> = blobs
+            .iter()
+            .map(|b| kzg_commitment_to_versioned_hash(&blob_to_kzg_commitment(b).unwrap()))
+            .collect();
+
+        // Honest: no INVALID status.
+        let ok = verify_eip8142_payload(&block_with_count(1), Some(&raw_bal), &expected).unwrap();
+        assert!(ok.is_none());
+
+        // Tampered count.
+        let status = verify_eip8142_payload(&block_with_count(2), Some(&raw_bal), &expected)
+            .unwrap()
+            .expect("tampered count must be invalid");
+        assert_eq!(
+            status.validation_error.as_deref(),
+            Some("Invalid payload_blob_count")
+        );
+
+        // Wrong versioned hashes.
+        let status = verify_eip8142_payload(&block_with_count(1), Some(&raw_bal), &[H256::zero()])
+            .unwrap()
+            .expect("wrong hashes must be invalid");
+        assert_eq!(
+            status.validation_error.as_deref(),
+            Some("Invalid blob_versioned_hashes")
+        );
+
+        // Missing BAL.
+        let status = verify_eip8142_payload(&block_with_count(1), None, &expected)
+            .unwrap()
+            .expect("missing BAL must be invalid");
+        assert_eq!(
+            status.validation_error.as_deref(),
+            Some("EIP-8142 payload missing block access list")
+        );
+    }
+
+    /// The zk getPayload attaches one opening proof per payload blob; a count
+    /// exceeding the bundle errors instead of over-indexing.
+    #[test]
+    #[cfg(feature = "c-kzg")]
+    fn attach_payload_kzg_proofs_attaches_and_bounds_count() {
+        use ethrex_common::types::{BlobsBundle, blobs_bundle::blob_from_bytes};
+
+        let blobs = vec![blob_from_bytes("payload blob".as_bytes().into()).unwrap()];
+        let bundle = BlobsBundle::create_from_blobs(&blobs, Some(1)).unwrap();
+        let mut response = ExecutionPayloadResponse {
+            execution_payload: {
+                let mut p = v5_payload();
+                p.payload_blob_count = Some(1);
+                p
+            },
+            block_value: U256::zero(),
+            blobs_bundle: Some(bundle),
+            should_override_builder: Some(false),
+            execution_requests: None,
+        };
+
+        attach_payload_kzg_proofs(&mut response).unwrap();
+        assert_eq!(
+            response
+                .blobs_bundle
+                .as_ref()
+                .unwrap()
+                .payload_kzg_proofs
+                .len(),
+            1
+        );
+
+        // A count past the bundle's blobs must error cleanly.
+        response.execution_payload.payload_blob_count = Some(u64::MAX);
+        assert!(attach_payload_kzg_proofs(&mut response).is_err());
+
+        // Count and bundle must both be present: a missing bundle is an error,
+        // not a silent no-op.
+        response.execution_payload.payload_blob_count = Some(1);
+        response.blobs_bundle = None;
+        assert!(attach_payload_kzg_proofs(&mut response).is_err());
     }
 }

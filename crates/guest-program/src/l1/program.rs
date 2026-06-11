@@ -403,9 +403,7 @@ fn new_payload_request_amsterdam_to_block(
     Ok(block)
 }
 
-/// Transform an EIP-8142 (Block-in-Blobs) SSZ `NewPayloadRequest` into a
-/// `Block`: the Amsterdam reconstruction plus the `payload_blob_count`
-/// header field.
+/// Transform an EIP-8142 "block-in-blobs" SSZ `NewPayloadRequest` into a `Block`.
 #[cfg(feature = "eip-8025")]
 fn new_payload_request_bib_to_block(
     req: &ethrex_common::types::eip8025_ssz::NewPayloadRequestBib,
@@ -477,6 +475,7 @@ fn new_payload_request_bib_to_block(
         requests_hash: Some(requests_hash),
         block_access_list_hash: Some(block_access_list_hash),
         slot_number: Some(payload.slot_number),
+        // New in EIP-8142
         payload_blob_count: Some(payload.payload_blob_count),
         ..Default::default()
     };
@@ -487,9 +486,8 @@ fn new_payload_request_bib_to_block(
 }
 
 /// Validate that the blob versioned hashes in the `NewPayloadRequest` match
-/// the payload-blob hashes (EIP-8142, leading) followed by the versioned
-/// hashes of the blob transactions, in order. EIP-8142 `new_payload` /
-/// `new_payload_zk` steps 4–5.
+/// the EIP-8142 payload-blob hashes followed by the versioned hashes of the
+/// blob transactions.
 #[cfg(feature = "eip-8025")]
 fn validate_versioned_hashes<'a>(
     transactions: &[ethrex_common::types::Transaction],
@@ -498,19 +496,19 @@ fn validate_versioned_hashes<'a>(
 ) -> Result<(), ExecutionError> {
     use ethrex_common::H256;
 
-    // Expected order: payload blobs first, then the versioned hashes of the
-    // blob transactions in order.
-    let computed_hashes = payload_versioned_hashes.iter().copied().chain(
-        transactions
-            .iter()
-            .flat_map(|tx| tx.blob_versioned_hashes()),
-    );
+    // All versioned hashes from blob transactions, in order
+    let tx_hashes = transactions
+        .iter()
+        .flat_map(|tx| tx.blob_versioned_hashes());
 
-    let expected_hashes = expected_blob_versioned_hashes
+    // Payload blobs first, then blob transactions in order
+    let all_hashes = payload_versioned_hashes.iter().copied().chain(tx_hashes);
+
+    let req_hashes = expected_blob_versioned_hashes
         .into_iter()
         .map(|h| H256::from_slice(h));
 
-    if !computed_hashes.eq(expected_hashes) {
+    if !all_hashes.eq(req_hashes) {
         return Err(ExecutionError::Internal(
             "versioned hashes mismatch between NewPayloadRequest and transactions".to_string(),
         ));
@@ -554,10 +552,12 @@ fn canonical_witness_into_execution_witness(
     crypto: &dyn Crypto,
 ) -> Result<ethrex_common::types::block_execution_witness::ExecutionWitness, ExecutionError> {
     let rpc_witness = canonical_execution_witness_to_rpc(witness);
+
     // Decode headers once; reused by the chain-linkage check and `into_execution_witness`.
     let decoded_headers = ethrex_common::types::block_execution_witness::decode_witness_headers(
         &rpc_witness.headers,
     )?;
+
     // EELS `test_validation_headers_non_contiguous_chain`: check chain linkage
     // in input order, before any sort/dedup.
     ethrex_common::types::block_execution_witness::validate_witness_headers_chain(
@@ -578,6 +578,7 @@ fn validate_eip8025_canonical_execution(
         .new_payload_request
         .execution_payload
         .timestamp;
+
     validate_canonical_chain_config(
         &stateless_input.chain_config,
         &chain_config,
@@ -588,6 +589,7 @@ fn validate_eip8025_canonical_execution(
         .new_payload_request
         .execution_payload
         .block_number;
+
     let execution_witness = canonical_witness_into_execution_witness(
         stateless_input.witness,
         chain_config,
@@ -603,11 +605,8 @@ fn validate_eip8025_canonical_execution(
     )
 }
 
-/// Validate the EIP-8142 (Block-in-Blobs) stateless input — ethrex's
-/// `new_payload_zk` (spec): the canonical chain-config/witness checks and
-/// block reconstruction, the payload-blob verification (spec steps 1–6 via
-/// [`verify_payload_blobs`]), ethrex's stateless public-key check (not in
-/// the spec), then step 7 (the EL STF) via [`execute_blocks`].
+/// Validate the EIP-8142 "block-in-blobs stateless input.
+/// Corresponds to `new_payload_zk` of the spec.
 #[cfg(feature = "eip-8025")]
 fn validate_eip8025_bib_execution(
     stateless_input: BibStatelessInput,
@@ -624,13 +623,13 @@ fn validate_eip8025_bib_execution(
     } = stateless_input;
 
     let block_timestamp = new_payload_request.execution_payload.timestamp;
+
     validate_canonical_chain_config(&canonical_chain_config, &chain_config, block_timestamp)?;
 
-    // A BiB input is only meaningful once EIP-8142 is active: reject instead
-    // of treating the declared payload-blob count as advisory.
+    // A BiB input is only meaningful once EIP-8142 is active.
     if !chain_config.is_eip8142_activated(block_timestamp) {
         return Err(ExecutionError::Internal(
-            "Block-in-Blobs stateless input for a block before EIP-8142 activation".to_string(),
+            "Block-in-blobs stateless input for a block before EIP-8142 activation".to_string(),
         ));
     }
 
@@ -649,13 +648,13 @@ fn validate_eip8025_bib_execution(
 
     validate_transaction_public_keys(&block, &public_keys, crypto.as_ref())?;
 
-    // 7. Run EL STF
     let execution_witness = canonical_witness_into_execution_witness(
         witness,
         chain_config,
         new_payload_request.execution_payload.block_number,
         crypto.as_ref(),
     )?;
+
     let _result = execute_blocks(
         &[block],
         execution_witness,
@@ -746,10 +745,10 @@ fn validate_eip8025_execution(
     )
     .map_err(|e| ExecutionError::Internal(format!("payload conversion: {e}")))?;
 
-    // Validate blob versioned hashes (no payload blobs before EIP-8142)
+    // Validate blob versioned hashes
     validate_versioned_hashes(
         &block.body.transactions,
-        &[],
+        &[], // no payload blobs before EIP-8142
         new_payload_request.versioned_hashes.iter(),
     )?;
 
@@ -814,15 +813,16 @@ fn validate_eip8025_amsterdam_execution(
     let block = new_payload_request_amsterdam_to_block(new_payload_request, crypto.as_ref())
         .map_err(|e| ExecutionError::Internal(format!("payload conversion: {e}")))?;
 
-    // No payload blobs before EIP-8142.
+    // Validate blob versioned hashes
     validate_versioned_hashes(
         &block.body.transactions,
-        &[],
+        &[], // no payload blobs before EIP-8142
         new_payload_request.versioned_hashes.iter(),
     )?;
 
     validate_transaction_public_keys(&block, &public_keys, crypto.as_ref())?;
 
+    // Execute statelessly — reuse the common `execute_blocks` infrastructure
     let _result = execute_blocks(
         &[block],
         execution_witness,
@@ -834,17 +834,7 @@ fn validate_eip8025_amsterdam_execution(
     Ok(())
 }
 
-/// EIP-8142 `new_payload_zk`, steps 1–6 (everything except step 7, the EL
-/// STF), with the spec's step numbering inline. The commitments and
-/// random-point opening proofs are private prover inputs computed host-side;
-/// verifying openings replaces the commitment recomputation (MSM) the native
-/// `new_payload` variant uses.
-///
-/// Step 6 goes through `Crypto::verify_blob_kzg_proof_batch` (the spec's
-/// function). Prototype scope: works on c-kzg backends (native, RISC0) and
-/// kzg-rs (SP1); errors on OpenVM/Zisk, which lack blob-level KZG —
-/// universal support and a true batched multi-pairing are future
-/// improvements.
+/// EIP-8142 `new_payload_zk`, steps 1–6 (everything except the EL STF)
 #[cfg(feature = "eip-8025")]
 fn verify_payload_blobs<'a>(
     transactions: &Vec<ethrex_common::types::Transaction>,
@@ -862,6 +852,7 @@ fn verify_payload_blobs<'a>(
     let n: usize = payload_blob_count
         .try_into()
         .map_err(|_| ExecutionError::Internal("payload_blob_count overflows usize".to_string()))?;
+
     if payload_kzg_commitments.len() != n || payload_kzg_proofs.len() != n {
         return Err(ExecutionError::Internal(format!(
             "payload blob private inputs mismatch: header declares {n} payload blobs but \
@@ -874,6 +865,7 @@ fn verify_payload_blobs<'a>(
     // 2. Derive payload blobs and versioned hashes
     let payload_blobs =
         execution_payload_to_blobs_from_raw_bal(raw_block_access_list, transactions);
+
     let payload_versioned_hashes: Vec<ethrex_common::H256> = payload_kzg_commitments
         .iter()
         .map(kzg_commitment_to_versioned_hash)
@@ -899,6 +891,7 @@ fn verify_payload_blobs<'a>(
     let valid = crypto
         .verify_blob_kzg_proof_batch(&payload_blobs, payload_kzg_commitments, payload_kzg_proofs)
         .map_err(|e| ExecutionError::Internal(format!("payload blob KZG verification: {e}")))?;
+
     if !valid {
         return Err(ExecutionError::Internal(
             "payload blobs do not match their KZG commitments".to_string(),
@@ -940,11 +933,14 @@ mod tests {
     }
 
     impl Crypto for StubKzgCrypto {
-        fn verify_blob_kzg_proof(
+        // Override the batch method `verify_payload_blobs` calls directly, so the
+        // stub takes effect regardless of which cfg arm provides the trait default
+        // (the c-kzg default delegates to c-kzg instead of the single-blob verify).
+        fn verify_blob_kzg_proof_batch(
             &self,
-            _blob: &[u8],
-            _commitment: &[u8; 48],
-            _proof: &[u8; 48],
+            _blobs: &[[u8; ethrex_crypto::kzg::BYTES_PER_BLOB]],
+            _commitments: &[[u8; 48]],
+            _proofs: &[[u8; 48]],
         ) -> Result<bool, CryptoError> {
             Ok(self.blob_proofs_valid)
         }
@@ -959,11 +955,8 @@ mod tests {
     fn verify_payload_blobs_accepts_matching_inputs() {
         let transactions = Vec::new();
         let bal = raw_bal();
-        let count = ethrex_common::types::eip8142::payload_blob_count(
-            &BlockAccessList::default(),
-            &transactions,
-        );
-        assert_eq!(count, 1, "empty payload data should fit one blob");
+        // Empty BAL + no txs packs into a single blob (just the 8-byte header).
+        let count = 1;
 
         let commitments = [[0xAA_u8; 48]];
         let proofs = [[0xBB_u8; 48]];
@@ -1062,6 +1055,30 @@ mod tests {
         .expect_err("invalid blob proof must fail");
         assert!(
             matches!(err, ExecutionError::Internal(msg) if msg.contains("do not match their KZG commitments"))
+        );
+    }
+
+    /// A BiB stateless input for a block before EIP-8142 activation must be
+    /// rejected (a prover must not be able to prove pre-fork blocks as BiB).
+    #[test]
+    fn bib_execution_rejects_inactive_fork() {
+        use ethrex_common::types::ChainConfig;
+
+        let stateless_input = crate::l1::input::sample_bib_stateless_input();
+        // chain_id matches the fixture so the config cross-check passes and the
+        // activation gate is what fires (eip8142_time unset).
+        let chain_config = ChainConfig {
+            chain_id: 1,
+            ..Default::default()
+        };
+        let err = super::validate_eip8025_bib_execution(
+            stateless_input,
+            chain_config,
+            Arc::new(NativeCrypto),
+        )
+        .expect_err("pre-activation BiB input must be rejected");
+        assert!(
+            matches!(err, ExecutionError::Internal(msg) if msg.contains("before EIP-8142 activation"))
         );
     }
 

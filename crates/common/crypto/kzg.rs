@@ -255,9 +255,8 @@ pub fn verify_kzg_proof(
     }
 }
 
-/// Computes the KZG commitment of a blob (commitment only, no proof). Native
-/// EIP-8142 `engine_newPayload` derives the payload-blob versioned hashes from
-/// these commitments.
+/// Computes the KZG commitment of a blob.
+/// Used during EIP-8142 "block-in-blobs" payload verification.
 #[cfg(feature = "c-kzg")]
 pub fn blob_to_kzg_commitment(blob: &Blob) -> Result<Commitment, KzgError> {
     let blob: c_kzg::Blob = (*blob).into();
@@ -267,13 +266,13 @@ pub fn blob_to_kzg_commitment(blob: &Blob) -> Result<Commitment, KzgError> {
 }
 
 /// Computes the random-point KZG opening proof of a blob given its commitment.
-/// EIP-8142's zkVM `getPayload` variant produces these (`payload_kzg_proofs`) for
-/// the payload blobs; the zkVM `new_payload` verifies them with
-/// `verify_blob_kzg_proof_batch` instead of recomputing commitments (the MSM).
+/// Used during EIP-8142 "block-in-blobs" payload creation.
+/// The guest program then verifies the payload blobs via `verify_blob_kzg_proof_batch`.
 #[cfg(feature = "c-kzg")]
 pub fn compute_blob_kzg_proof(blob: &Blob, commitment: &Commitment) -> Result<Proof, KzgError> {
+    let blob: c_kzg::Blob = (*blob).into();
     let c_kzg_settings = c_kzg::ethereum_kzg_settings(KZG_PRECOMPUTE);
-    let proof = c_kzg_settings.compute_blob_kzg_proof(&(*blob).into(), &(*commitment).into())?;
+    let proof = c_kzg_settings.compute_blob_kzg_proof(&blob, &(*commitment).into())?;
     Ok(proof.to_bytes().into_inner())
 }
 

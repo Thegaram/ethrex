@@ -195,6 +195,7 @@ impl RLPDecode for WrappedEIP4844Transaction {
                 blobs,
                 commitments,
                 proofs,
+                // `payload_kzg_proofs` is left empty for user (type-3) blobs
                 payload_kzg_proofs: Vec::new(),
                 version: wrapper_version.unwrap_or_default(),
             },
