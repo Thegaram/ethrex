@@ -13,17 +13,13 @@ use crate::types::{
 use ethrex_rlp::{decode::RLPDecode, encode::RLPEncode, error::RLPDecodeError};
 use thiserror::Error;
 
-/// Usable bytes per field element: 31 bytes carry data while the
-/// most-significant byte (index 0, big-endian) is left zero so every field
-/// element stays below the BLS modulus (is canonical).
+/// Usable bytes per field element, index 0 (MSB in big-endian) is left zero.
 const USABLE_BYTES_PER_FIELD_ELEMENT: usize = 31;
-/// Usable bytes across all the field elements of a single blob.
-const USABLE_BYTES_PER_BLOB: usize = SAFE_BYTES_PER_BLOB; // FIELD_ELEMENTS_PER_BLOB * 31
-
+/// Total usable bytes per blob: FIELD_ELEMENTS_PER_BLOB * 31.
+const USABLE_BYTES_PER_BLOB: usize = SAFE_BYTES_PER_BLOB;
 /// Width of each big-endian `u32` length prefix in the packed payload header.
 const LENGTH_PREFIX_SIZE: usize = 4;
-/// Packed payload header: a length prefix for the BAL followed by one for the
-/// transactions.
+/// Packed payload header: BAL length + transactions length.
 const HEADER_SIZE: usize = 2 * LENGTH_PREFIX_SIZE;
 
 /// The subset of an execution payload published via blobs under EIP-8142.
@@ -35,15 +31,15 @@ pub struct ExecutionPayloadData {
     pub transactions: Vec<Transaction>,
 }
 
-/// Errors returned when decoding blobs back into execution-payload data.
+/// Payload blob decoding errors.
 #[derive(Debug, Error)]
 pub enum BibError {
     #[error("blob field element {0} has a non-zero most-significant byte")]
     NonZeroPadding(usize),
     #[error(
-        "packed payload is truncated: header declares {declared} bytes but only {available} are present"
+        "packed payload is incomplete: header declares {declared} bytes but only {available} are available"
     )]
-    Truncated { declared: usize, available: usize },
+    Incomplete { declared: usize, available: usize },
     #[error("blob has non-zero trailing data after the declared payload")]
     TrailingData,
     #[error("failed to RLP-decode packed payload: {0}")]
@@ -67,18 +63,22 @@ fn payload_parts_to_blobs(bal_bytes: &[u8], txs_bytes: &[u8]) -> Vec<Blob> {
 
 /// Encodes the block access list and transactions of an execution payload into
 /// blobs, prefixed with an 8-byte header holding their big-endian `u32` lengths.
-pub fn execution_payload_data_to_blobs(data: &ExecutionPayloadData) -> Vec<Blob> {
+///
+/// The fields of the spec's `ExecutionPayloadData` are taken by reference, so
+/// callers (the builder) don't have to clone them into an owning struct.
+pub fn execution_payload_data_to_blobs(
+    block_access_list: &BlockAccessList,
+    transactions: &Vec<Transaction>,
+) -> Vec<Blob> {
     payload_parts_to_blobs(
-        &data.block_access_list.encode_to_vec(),
-        &data.transactions.encode_to_vec(),
+        &block_access_list.encode_to_vec(),
+        &transactions.encode_to_vec(),
     )
 }
 
 /// Like [`execution_payload_data_to_blobs`], but takes the block access list as the
 /// raw RLP bytes received in the payload. Per the EIP-8142 spec, `blockAccessList`
-/// is opaque bytes, so using them verbatim avoids a decode→re-encode round-trip
-/// (and the non-canonical mismatch it could introduce). Transactions are still
-/// RLP-encoded as a list. Used by `engine_newPayload` verification.
+/// is opaque bytes, so using them verbatim avoids a decode→re-encode round-trip.
 pub fn execution_payload_to_blobs_from_raw_bal(
     bal_bytes: &[u8],
     transactions: &Vec<Transaction>,
@@ -86,52 +86,40 @@ pub fn execution_payload_to_blobs_from_raw_bal(
     payload_parts_to_blobs(bal_bytes, &transactions.encode_to_vec())
 }
 
-/// Number of blobs the execution-payload data (block access list + transactions)
-/// packs into, computed from the RLP-encoded lengths without materializing the
-/// blobs. Equal to `execution_payload_data_to_blobs(..).len()`.
-pub fn payload_blob_count(
-    block_access_list: &BlockAccessList,
-    transactions: &Vec<Transaction>,
-) -> u64 {
-    let len = HEADER_SIZE + block_access_list.length() + transactions.length();
-    len.div_ceil(USABLE_BYTES_PER_BLOB) as u64
-}
-
 /// Decodes blobs produced by [`execution_payload_data_to_blobs`] back into the
-/// block access list and transactions by reading the 8-byte length header.
-///
-/// Rejects non-canonical encodings: a header whose declared lengths exceed the
-/// unpacked bytes, or non-zero trailing data after the declared payload.
+/// block access list and transactions based on the 8-byte length header.
 pub fn blobs_to_execution_payload_data(blobs: &[Blob]) -> Result<ExecutionPayloadData, BibError> {
     let raw = blobs_to_bytes(blobs)?;
 
-    let truncated = |declared: usize| BibError::Truncated {
+    let incomplete = |declared: usize| BibError::Incomplete {
         declared,
         available: raw.len(),
     };
+
+    // Decode header
     let Some((bal_length_bytes, rest)) = raw.split_first_chunk::<LENGTH_PREFIX_SIZE>() else {
-        return Err(truncated(HEADER_SIZE));
+        return Err(incomplete(HEADER_SIZE));
     };
     let bal_length = u32::from_be_bytes(*bal_length_bytes) as usize;
 
     let Some((txs_length_bytes, rest)) = rest.split_first_chunk::<LENGTH_PREFIX_SIZE>() else {
-        return Err(truncated(HEADER_SIZE));
+        return Err(incomplete(HEADER_SIZE));
     };
     let txs_length = u32::from_be_bytes(*txs_length_bytes) as usize;
 
-    // The declared size can overflow `usize` on 32-bit (zkVM) targets for
-    // adversarial headers. Saturating here is for the error message only.
     let declared_total = HEADER_SIZE
         .saturating_add(bal_length)
         .saturating_add(txs_length);
 
+    // Decode BAL
     let Some((bal_bytes, rest)) = rest.split_at_checked(bal_length) else {
-        return Err(truncated(declared_total));
+        return Err(incomplete(declared_total));
     };
     let block_access_list = BlockAccessList::decode(bal_bytes)?;
 
+    // Decode transactions
     let Some((txs_bytes, padding)) = rest.split_at_checked(txs_length) else {
-        return Err(truncated(declared_total));
+        return Err(incomplete(declared_total));
     };
     let transactions = Vec::<Transaction>::decode(txs_bytes)?;
 
@@ -153,41 +141,43 @@ fn bytes_to_blobs(data: &[u8]) -> Vec<Blob> {
         .collect()
 }
 
-/// Packs up to [`USABLE_BYTES_PER_BLOB`] bytes into a single blob. Each 31-byte
-/// chunk lands in bytes `[1..32]` of a field element, leaving the
+/// Packs up to [`USABLE_BYTES_PER_BLOB`] bytes into a single blob.
+/// Each 31-byte chunk lands in bytes `[1..32]` of a field element, leaving the
 /// most-significant byte (index 0) zero so the big-endian element is canonical.
 fn chunk_to_blob(data: &[u8]) -> Blob {
     debug_assert!(data.len() <= USABLE_BYTES_PER_BLOB);
     let mut blob = [0u8; BYTES_PER_BLOB];
     for (i, chunk) in data.chunks(USABLE_BYTES_PER_FIELD_ELEMENT).enumerate() {
-        let field_element_start = i * BYTES_PER_FIELD_ELEMENT;
-        let data_start = field_element_start + 1;
-        blob[data_start..data_start + chunk.len()].copy_from_slice(chunk);
+        let fe_start = i * BYTES_PER_FIELD_ELEMENT;
+        let data_start = fe_start + 1; // skip index 0
+        blob[data_start..data_start + chunk.len()].copy_from_slice(chunk); // copy <=31 bytes
     }
     blob
 }
 
 /// Unpacks blobs back into bytes, concatenating the usable bytes of each.
 fn blobs_to_bytes(blobs: &[Blob]) -> Result<Vec<u8>, BibError> {
-    let mut raw = Vec::with_capacity(blobs.len() * USABLE_BYTES_PER_BLOB);
-    for blob in blobs {
-        blob_to_chunk(blob, &mut raw)?;
+    let mut data = vec![0u8; blobs.len() * USABLE_BYTES_PER_BLOB];
+    let (chunks, rest) = data.as_chunks_mut::<USABLE_BYTES_PER_BLOB>();
+    debug_assert!(rest.is_empty());
+    for (blob, chunk) in blobs.iter().zip(chunks) {
+        blob_to_chunk(blob, chunk)?;
     }
-    Ok(raw)
+    Ok(data)
 }
 
-/// Appends the 31 usable bytes (`[1..32]`) of every field element of `blob` to
-/// `out`, validating that each field element's most-significant byte (index 0)
-/// is zero.
-fn blob_to_chunk(blob: &Blob, out: &mut Vec<u8>) -> Result<(), BibError> {
+/// Fills `out` with the 31 usable bytes (`[1..32]`) of every field element of
+/// `blob`, validating that each field element's MSB (index 0) is zero.
+fn blob_to_chunk(blob: &Blob, out: &mut [u8; USABLE_BYTES_PER_BLOB]) -> Result<(), BibError> {
     for i in 0..FIELD_ELEMENTS_PER_BLOB {
-        let field_element_start = i * BYTES_PER_FIELD_ELEMENT;
-        if blob[field_element_start] != 0 {
+        let fe_start = i * BYTES_PER_FIELD_ELEMENT;
+        if blob[fe_start] != 0 {
             return Err(BibError::NonZeroPadding(i));
         }
-        out.extend_from_slice(
-            &blob[field_element_start + 1..field_element_start + BYTES_PER_FIELD_ELEMENT],
-        );
+        let usable_bytes = &blob[fe_start + 1..fe_start + BYTES_PER_FIELD_ELEMENT];
+        // copy 31 bytes
+        let data_start = i * USABLE_BYTES_PER_FIELD_ELEMENT;
+        out[data_start..data_start + USABLE_BYTES_PER_FIELD_ELEMENT].copy_from_slice(usable_bytes);
     }
     Ok(())
 }
@@ -231,7 +221,7 @@ mod tests {
     fn blob_to_chunk_rejects_non_zero_msb() {
         let mut blob = [0u8; BYTES_PER_BLOB];
         blob[0] = 1; // most-significant byte of the first field element
-        let mut out = Vec::new();
+        let mut out = [0u8; USABLE_BYTES_PER_BLOB];
         assert!(matches!(
             blob_to_chunk(&blob, &mut out),
             Err(BibError::NonZeroPadding(0))
@@ -245,18 +235,9 @@ mod tests {
             transactions: Vec::new(),
         };
 
-        let blobs = execution_payload_data_to_blobs(&data);
+        let blobs = execution_payload_data_to_blobs(&data.block_access_list, &data.transactions);
         let decoded = blobs_to_execution_payload_data(&blobs).unwrap();
         assert_eq!(decoded, data);
-    }
-
-    #[test]
-    fn payload_blob_count_matches_encoding() {
-        let data = ExecutionPayloadData::default();
-        assert_eq!(
-            payload_blob_count(&data.block_access_list, &data.transactions),
-            execution_payload_data_to_blobs(&data).len() as u64
-        );
     }
 
     #[test]
@@ -264,13 +245,15 @@ mod tests {
         let blobs: Vec<Blob> = Vec::new();
         assert!(matches!(
             blobs_to_execution_payload_data(&blobs),
-            Err(BibError::Truncated { .. })
+            Err(BibError::Incomplete { .. })
         ));
     }
 
     #[test]
     fn blobs_to_execution_payload_data_rejects_trailing_data() {
-        let mut blobs = execution_payload_data_to_blobs(&ExecutionPayloadData::default());
+        let data = ExecutionPayloadData::default();
+        let mut blobs =
+            execution_payload_data_to_blobs(&data.block_access_list, &data.transactions);
         // Corrupt a usable data byte far past the declared payload. The blob's
         // last byte is a data byte (not an MSB), so it bypasses the per-element
         // check and lands in the trailing padding region.
@@ -279,6 +262,46 @@ mod tests {
         assert!(matches!(
             blobs_to_execution_payload_data(&blobs),
             Err(BibError::TrailingData)
+        ));
+    }
+
+    #[test]
+    fn raw_bal_encoding_matches_typed_encoding() {
+        // The builder encodes from the typed BAL, the verifier from the raw RLP
+        // bytes received in the payload; both must produce identical blobs.
+        let bal = BlockAccessList::default();
+        let txs = Vec::new();
+        assert_eq!(
+            execution_payload_to_blobs_from_raw_bal(&bal.encode_to_vec(), &txs),
+            execution_payload_data_to_blobs(&bal, &txs),
+        );
+    }
+
+    #[test]
+    fn decode_rejects_adversarial_declared_lengths() {
+        // A header declaring u32::MAX-length sections must be rejected cleanly
+        // (no panic / no usize overflow — guests are 32-bit).
+        let mut blob = [0u8; BYTES_PER_BLOB];
+        // Field-element layout: data lives in bytes [1..32]; the 8-byte length
+        // header occupies the first 8 usable bytes.
+        blob[1..5].copy_from_slice(&u32::MAX.to_be_bytes()); // bal_length
+        blob[5..9].copy_from_slice(&u32::MAX.to_be_bytes()); // txs_length
+        assert!(matches!(
+            blobs_to_execution_payload_data(&[blob]),
+            Err(BibError::Incomplete { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_garbage_block_access_list() {
+        // Sections that fit but don't RLP-decode surface as `Rlp`, not a panic.
+        let mut blob = [0u8; BYTES_PER_BLOB];
+        blob[1..5].copy_from_slice(&1u32.to_be_bytes()); // bal_length = 1
+        // txs_length = 0; bal byte = 0x81 (truncated RLP string header)
+        blob[9] = 0x81;
+        assert!(matches!(
+            blobs_to_execution_payload_data(&[blob]),
+            Err(BibError::Rlp(_))
         ));
     }
 }

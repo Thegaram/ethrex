@@ -29,7 +29,6 @@ const MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD: usize = 16;
 /// `MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD` (Electra).
 const MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD: usize = 2;
 /// `MAX_BLOB_COMMITMENTS_PER_BLOCK` (Electra).
-/// EIP-8142: Also limits the payload-blob KZG commitment/proof lists in the stateless input.
 pub const MAX_BLOB_COMMITMENTS_PER_BLOCK: usize = 4096;
 /// `MAX_BLOCK_ACCESS_LIST_BYTES` (Amsterdam).
 const MAX_BLOCK_ACCESS_LIST_BYTES: usize = 16777216;
@@ -197,9 +196,8 @@ pub struct ExecutionPayloadV4 {
     pub slot_number: u64,
 }
 
-/// SSZ `ExecutionPayload` for EIP-8142 (Block-in-Blobs): the Amsterdam
-/// payload plus the `payload_blob_count` field the EIP appends to the CL
-/// `ExecutionPayload` container.
+/// SSZ `ExecutionPayload` execution payload V5.
+/// Used for EIP-8142 "block-in-blobs".
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
 pub struct ExecutionPayloadV5 {
     pub parent_hash: [u8; 32],
@@ -222,7 +220,7 @@ pub struct ExecutionPayloadV5 {
     pub excess_blob_gas: u64,
     pub block_access_list: SszList<u8, MAX_BLOCK_ACCESS_LIST_BYTES>,
     pub slot_number: u64,
-    /// `[New in EIP8142]` Number of payload blobs.
+    /// New in EIP8142 "block-in-blobs"
     pub payload_blob_count: u64,
 }
 
@@ -289,11 +287,10 @@ pub struct NewPayloadRequestAmsterdam {
     pub execution_requests: ExecutionRequests,
 }
 
-/// SSZ `NewPayloadRequest` for EIP-8142 (Block-in-Blobs). The payload's
-/// `payload_blob_count` marks the first `versioned_hashes` entries as
-/// payload-blob hashes; the rest belong to type-3 transactions. The
-/// payload-blob KZG commitments and opening proofs are *not* part of this
-/// container (and so not of its hash-tree-root): they are private prover
+/// SSZ `NewPayloadRequest` for EIP-8142 "block-in-blobs".
+///
+/// Note: The payload-blob KZG commitments and opening proofs are *not* part
+/// of this container (and so not of its hash-tree-root): they are private prover
 /// inputs, carried alongside it in the stateless input like `public_keys`.
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
 pub struct NewPayloadRequestBib {

@@ -32,10 +32,10 @@ pub struct BlobsBundle {
     pub commitments: Vec<Commitment>,
     #[serde(with = "serde_utils::bytes48::vec")]
     pub proofs: Vec<Proof>,
-    /// EIP-8142 zkVM variant: random-point KZG opening proofs for the payload
-    /// blobs (the first `payload_blob_count` entries), used as private inputs to the
-    /// zkVM `verify_blob_kzg_proof_batch`. Empty for the native getPayload response
-    /// and for type-3 transaction bundles, and not part of the p2p RLP wire.
+    /// EIP-8142 "block-in-blobs": Add random-point KZG opening proofs for the payload blobs.
+    /// These will be passed as private input to the prover guest program and batch-verified.
+    /// This field is omitted in normal engine API responses.
+    /// Note: `proofs` are cell proofs, while `payload_kzg_proofs` are random-point KZG opening proofs.
     #[serde(
         with = "serde_utils::bytes48::vec",
         skip_serializing_if = "Vec::is_empty",
@@ -86,20 +86,6 @@ pub fn kzg_commitment_to_versioned_hash(data: &Commitment) -> H256 {
     versioned_hash.into()
 }
 
-/// The blob "wrapper version" mandated by `fork`: `0` (blob proofs, EIP-4844)
-/// before Osaka, `1` (cell proofs, EIP-7594) on Osaka+. Centralizing the
-/// fork→version mapping keeps producers and validators in agreement, so a future
-/// fork that keeps the cell-proof scheme but bumps the version only needs to change
-/// this function. (A genuinely new proof scheme would still require changes in
-/// [`BlobsBundle::create_from_blobs`] and `verify_kzg_proofs`.)
-pub fn blob_wrapper_version(fork: crate::types::Fork) -> u8 {
-    if fork >= crate::types::Fork::Osaka {
-        1
-    } else {
-        0
-    }
-}
-
 impl BlobsBundle {
     pub fn empty() -> Self {
         Self::default()
@@ -138,6 +124,7 @@ impl BlobsBundle {
             blobs: blobs.clone(),
             commitments,
             proofs,
+            // `payload_kzg_proofs` are computed later if needed.
             payload_kzg_proofs: Vec::new(),
             version: wrapper_version.unwrap_or(0),
         })
@@ -150,14 +137,14 @@ impl BlobsBundle {
             .collect()
     }
 
-    /// Computes the EIP-8142 `payload_kzg_proofs`: random-point KZG opening proofs
-    /// for the first `payload_blob_count` blobs (the payload blobs, which are
-    /// prepended ahead of the type-3 transaction blobs), using their commitments.
+    /// Computes random-point KZG opening proofs for payload blobs (EIP-8142 "block-in-blobs").
     #[cfg(feature = "c-kzg")]
     pub fn compute_payload_kzg_proofs(
         &self,
         payload_blob_count: usize,
     ) -> Result<Vec<Proof>, BlobsBundleError> {
+        use ethrex_crypto::kzg::compute_blob_kzg_proof;
+
         if self.blobs.len() < payload_blob_count || self.commitments.len() < payload_blob_count {
             return Err(BlobsBundleError::BlobsBundleWrongLen);
         }
@@ -165,10 +152,23 @@ impl BlobsBundle {
             .iter()
             .zip(&self.commitments[..payload_blob_count])
             .map(|(blob, commitment)| {
-                ethrex_crypto::kzg::compute_blob_kzg_proof(blob, commitment)
-                    .map_err(BlobsBundleError::from)
+                compute_blob_kzg_proof(blob, commitment).map_err(BlobsBundleError::from)
             })
             .collect()
+    }
+
+    /// Combines EIP-8142 payload blobs with user (type-3) blobs into a single blob bundle.
+    pub fn from_sections(
+        payload: PayloadBlobsBundle,
+        user: BlobsBundle,
+    ) -> Result<Self, BlobsBundleError> {
+        if !user.payload_kzg_proofs.is_empty() {
+            return Err(BlobsBundleError::UserBundleHasPayloadProofs);
+        }
+        // ignore version mismatch, just like +=
+        let mut bundle = payload.0;
+        bundle += user;
+        Ok(bundle)
     }
 
     /// Given an index returns all or nothing `BlobTuple` if either of the commitment, proof or
@@ -247,9 +247,9 @@ impl BlobsBundle {
             return Err(BlobsBundleError::BlobBundleEmptyError);
         }
 
-        // The wrapper version is fork-specific (blob proofs before Osaka, cell
-        // proofs on Osaka+); any other value is invalid.
-        let expected_version = blob_wrapper_version(fork);
+        // The wrapper version is fork-specific: 0 (blob proofs) before Osaka, 1 (cell
+        // proofs, EIP-7594) on Osaka+. Any other value is invalid.
+        let expected_version = if fork >= Fork::Osaka { 1 } else { 0 };
         if self.version != expected_version {
             return Err(BlobsBundleError::InvalidBlobVersionForFork);
         }
@@ -309,13 +309,28 @@ impl RLPDecode for BlobsBundle {
                 blobs,
                 commitments,
                 proofs,
-                // Not part of the p2p RLP wire; payload-blob proofs travel only in
-                // the engine/prover path.
+                // `payload_kzg_proofs` are used in the engine/prover path only,
+                // excluded from normal Engine API responses
                 payload_kzg_proofs: Vec::new(),
                 version: version.unwrap_or_default(),
             },
             decoder.finish()?,
         ))
+    }
+}
+
+/// EIP-8142 "block-in-blobs": a bundle holding only payload blobs. This type
+/// enforces the ordering guarantee that payload blobs come before user blobs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PayloadBlobsBundle(BlobsBundle);
+
+impl PayloadBlobsBundle {
+    #[cfg(feature = "c-kzg")]
+    pub fn create_from_blobs(
+        blobs: &Vec<Blob>,
+        wrapper_version: Option<u8>,
+    ) -> Result<Self, BlobsBundleError> {
+        BlobsBundle::create_from_blobs(blobs, wrapper_version).map(Self)
     }
 }
 
@@ -357,6 +372,8 @@ pub enum BlobsBundleError {
     MaxBlobsExceeded,
     #[error("Invalid blob version for the current fork")]
     InvalidBlobVersionForFork,
+    #[error("user blob bundle unexpectedly carries payload KZG proofs")]
+    UserBundleHasPayloadProofs,
     #[cfg(feature = "c-kzg")]
     #[error("KZG related error: {0}")]
     Kzg(#[from] ethrex_crypto::kzg::KzgError),
@@ -502,8 +519,8 @@ mod tests {
                                 shared::convert_str_to_bytes48(s)
                             })
                             .collect(),
-                            version: 0,
             payload_kzg_proofs: Vec::new(),
+            version: 0,
         };
 
         let tx = crate::types::transaction::EIP4844Transaction {
@@ -555,8 +572,8 @@ mod tests {
                                 shared::convert_str_to_bytes48(s)
                               })
                               .collect(),
-                              version: 0,
             payload_kzg_proofs: Vec::new(),
+            version: 0,
         };
 
         let tx = crate::types::transaction::EIP4844Transaction {
@@ -662,7 +679,7 @@ mod tests {
     #[test]
     #[cfg(feature = "c-kzg")]
     fn compute_payload_kzg_proofs_produces_verifiable_proofs() {
-        use ethrex_crypto::kzg::verify_blob_kzg_proof;
+        use ethrex_crypto::{Crypto, NativeCrypto};
 
         // Three blobs; the first two stand in for payload blobs, the third for a
         // type-3 transaction blob.
@@ -686,17 +703,78 @@ mod tests {
 
         // One proof per payload blob — only the leading `payload_blob_count` blobs.
         assert_eq!(proofs.len(), payload_blob_count);
-        for i in 0..payload_blob_count {
-            assert!(
-                verify_blob_kzg_proof(bundle.blobs[i], bundle.commitments[i], proofs[i])
-                    .expect("verification errored")
-            );
-        }
+        // These proofs are exactly what the zkVM `new_payload` checks in one batch
+        // call (spec step 6), so verify them through the same entry point.
+        assert!(
+            NativeCrypto
+                .verify_blob_kzg_proof_batch(
+                    &bundle.blobs[..payload_blob_count],
+                    &bundle.commitments[..payload_blob_count],
+                    &proofs,
+                )
+                .expect("verification errored")
+        );
+
+        // Proof-to-blob alignment matters: the same proofs in the wrong order
+        // must not verify.
+        let swapped: Vec<_> = proofs.iter().rev().copied().collect();
+        assert!(
+            !NativeCrypto
+                .verify_blob_kzg_proof_batch(
+                    &bundle.blobs[..payload_blob_count],
+                    &bundle.commitments[..payload_blob_count],
+                    &swapped,
+                )
+                .expect("verification errored")
+        );
 
         // A count past the available blobs is rejected.
         assert!(matches!(
             bundle.compute_payload_kzg_proofs(bundle.blobs.len() + 1),
             Err(crate::types::BlobsBundleError::BlobsBundleWrongLen)
+        ));
+    }
+
+    #[test]
+    fn payload_blobs_bundle_orders_payload_first_and_keeps_section_metadata() {
+        use crate::types::{BYTES_PER_BLOB, BlobsBundle, BlobsBundleError};
+
+        // The tuple constructor is private to this module: sections are only
+        // built through `create_from_blobs` in production.
+        let payload_section = super::PayloadBlobsBundle(BlobsBundle {
+            blobs: vec![[1u8; BYTES_PER_BLOB], [2u8; BYTES_PER_BLOB]],
+            commitments: vec![[1u8; 48], [2u8; 48]],
+            proofs: vec![[1u8; 48], [2u8; 48]],
+            payload_kzg_proofs: vec![[0xAAu8; 48], [0xBBu8; 48]],
+            version: 1,
+        });
+        let user = BlobsBundle {
+            blobs: vec![[3u8; BYTES_PER_BLOB]],
+            commitments: vec![[3u8; 48]],
+            proofs: vec![[3u8; 48]],
+            payload_kzg_proofs: Vec::new(),
+            // Accumulated bundles carry a stale `version` label (`+=` keeps the
+            // lhs's, starting from `default()`); `from_sections` ignores it, so
+            // the realistic stale `0` composes fine with a version-1 section.
+            version: 0,
+        };
+
+        let combined = BlobsBundle::from_sections(payload_section.clone(), user.clone())
+            .expect("composition should succeed");
+        // Payload blobs strictly first, then the user blobs.
+        assert_eq!(combined.blobs[0][0], 1);
+        assert_eq!(combined.blobs[2][0], 3);
+        assert_eq!(combined.commitments, vec![[1u8; 48], [2u8; 48], [3u8; 48]]);
+        // The payload section's version and (prefix-aligned) payload proofs stay.
+        assert_eq!(combined.version, 1);
+        assert_eq!(combined.payload_kzg_proofs.len(), 2);
+
+        // A user bundle carrying payload proofs would be misaligned: rejected.
+        let mut bad_user = user;
+        bad_user.payload_kzg_proofs = vec![[0xCCu8; 48]];
+        assert!(matches!(
+            BlobsBundle::from_sections(payload_section, bad_user),
+            Err(BlobsBundleError::UserBundleHasPayloadProofs)
         ));
     }
 }

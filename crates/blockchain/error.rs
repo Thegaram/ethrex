@@ -32,6 +32,8 @@ pub enum ChainError {
     InvalidTransaction(String),
     #[error("Failed to generate witness: {0}")]
     WitnessGeneration(String),
+    #[error("EIP-8142 blobs bundle error: {0}")]
+    BlobsBundle(#[from] BlobsBundleError),
     #[error("{0}")]
     Custom(String),
     #[error("Unknown Payload")]

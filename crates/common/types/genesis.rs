@@ -368,34 +368,6 @@ impl From<Fork> for &str {
 }
 
 impl ChainConfig {
-    /// Checks cross-fork configuration invariants, to be run once when the chain
-    /// config is loaded so misconfigurations fail at startup rather than mid-block.
-    ///
-    /// Currently: EIP-8142 publishes the Amsterdam block access list via blobs, so
-    /// it requires Amsterdam — `eip8142_time` (when set) must be at or after
-    /// `amsterdam_time`.
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(eip8142_time) = self.eip8142_time {
-            match self.amsterdam_time {
-                None => {
-                    return Err(
-                        "eip8142_time is set but amsterdam_time is not; EIP-8142 requires \
-                         the Amsterdam block access list"
-                            .to_string(),
-                    );
-                }
-                Some(amsterdam_time) if amsterdam_time > eip8142_time => {
-                    return Err(format!(
-                        "eip8142_time ({eip8142_time}) must be >= amsterdam_time \
-                         ({amsterdam_time}); EIP-8142 requires the Amsterdam block access list"
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
-        Ok(())
-    }
-
     pub fn is_eip8142_activated(&self, block_timestamp: u64) -> bool {
         self.eip8142_time
             .is_some_and(|time| time <= block_timestamp)
@@ -832,45 +804,6 @@ mod tests {
     use crate::types::INITIAL_BASE_FEE;
 
     use super::*;
-
-    #[test]
-    fn validate_rejects_eip8142_misconfiguration() {
-        // EIP-8142 requires Amsterdam.
-        let unset = ChainConfig {
-            eip8142_time: None,
-            amsterdam_time: None,
-            ..Default::default()
-        };
-        assert!(unset.validate().is_ok());
-
-        let ok = ChainConfig {
-            amsterdam_time: Some(100),
-            eip8142_time: Some(100),
-            ..Default::default()
-        };
-        assert!(ok.validate().is_ok());
-
-        let after = ChainConfig {
-            amsterdam_time: Some(100),
-            eip8142_time: Some(200),
-            ..Default::default()
-        };
-        assert!(after.validate().is_ok());
-
-        let missing_amsterdam = ChainConfig {
-            amsterdam_time: None,
-            eip8142_time: Some(100),
-            ..Default::default()
-        };
-        assert!(missing_amsterdam.validate().is_err());
-
-        let before_amsterdam = ChainConfig {
-            amsterdam_time: Some(200),
-            eip8142_time: Some(100),
-            ..Default::default()
-        };
-        assert!(before_amsterdam.validate().is_err());
-    }
 
     #[test]
     fn terminal_total_difficulty_accepts_number_or_hex_string() {

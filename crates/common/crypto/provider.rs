@@ -543,9 +543,8 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
             .map_err(|e| CryptoError::Other(e.to_string()))
     }
 
-    /// Verify a batch of blob KZG proofs
-    /// (consensus-specs `verify_blob_kzg_proof_batch`)
-    /// Used by EIP-8142 "block-in-blobs" for payload-blob verification.
+    /// Verify a batch of blob KZG proofs.
+    /// Used during EIP-8142 "block-in-blobs" payload blob verification in the guest program.
     #[cfg(feature = "c-kzg")]
     fn verify_blob_kzg_proof_batch(
         &self,
@@ -558,16 +557,11 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
                 "blobs, commitments and proofs must have the same length",
             ));
         }
-        // Simply delegate to the underlying c-kzg implementation.
+
         crate::kzg::verify_kzg_proof_batch(blobs, commitments, proofs)
             .map_err(|e| CryptoError::Other(e.to_string()))
     }
 
-    /// Loops over `verify_blob_kzg_proof`, so this works where the backend
-    /// has a blob-level KZG library (kzg-rs on SP1) and surfaces the
-    /// underlying `Unimplemented` error on OpenVM/Zisk. Universal backend
-    /// support (point-evaluation reduction) and a true batched verification
-    /// are future improvements.
     #[cfg(not(feature = "c-kzg"))]
     fn verify_blob_kzg_proof_batch(
         &self,
@@ -580,7 +574,11 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
                 "blobs, commitments and proofs must have the same length",
             ));
         }
+        // Temporary workaround: Loop and call `verify_blob_kzg_proof`.
+        // Universal backend support and true batched verification will be added later.
         for ((blob, commitment), proof) in blobs.iter().zip(commitments).zip(proofs) {
+            // This works where the backend has a blob-level KZG library (kzg-rs on SP1)
+            // and surfaces the underlying `Unimplemented` error on OpenVM/Zisk.
             if !self.verify_blob_kzg_proof(blob, commitment, proof)? {
                 return Ok(false);
             }
