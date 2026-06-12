@@ -87,6 +87,7 @@ fn validate_cheap_passes_with_invalid_kzg_proofs() {
         blobs: blobs.clone(),
         commitments: valid_bundle.commitments.clone(),
         proofs: vec![[0u8; 48]], // invalid proof
+        payload_kzg_proofs: Vec::new(),
         version: 0,
     };
 
@@ -131,6 +132,7 @@ fn validate_cheap_rejects_more_than_six_blobs_per_tx_on_osaka() {
         blobs: vec![one.blobs[0]; 7],
         commitments: vec![one.commitments[0]; 7],
         proofs: one.proofs.repeat(7),
+        payload_kzg_proofs: Vec::new(),
         version: 1,
     };
     let tx = ethrex_common::types::EIP4844Transaction {

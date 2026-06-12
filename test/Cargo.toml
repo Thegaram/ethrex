@@ -10,9 +10,21 @@ path = "src/lib.rs"
 [features]
 rocksdb = ["ethrex-storage/rocksdb"]
 l2 = []
-c-kzg = ["ethrex-common/c-kzg"]
+c-kzg = [
+    "ethrex-common/c-kzg",
+    "ethrex-blockchain/c-kzg",
+    "ethrex-rpc/c-kzg",
+    "ethrex-guest-program/c-kzg",
+]
 rayon = ["ethrex-levm/rayon"]
-eip-8025 = ["ethrex-levm/eip-8025"]
+# Mirrors ef_tests' `stateless` wiring: eip-8025 must be enabled on every
+# crate that cfg-gates on it, or cross-crate cfg mismatches break the build.
+eip-8025 = [
+    "ethrex-levm/eip-8025",
+    "ethrex-blockchain/eip-8025",
+    "ethrex-rpc/eip-8025",
+    "ethrex-guest-program/eip-8025",
+]
 
 [dependencies]
 ethrex-common.workspace = true
@@ -54,6 +66,10 @@ ethrex-l2.workspace = true
 ethrex-l2-rpc.workspace = true
 reqwest.workspace = true
 tokio-util.workspace = true
+# EIP-8142 guest-program round-trip tests (feature-gated, see [features])
+ethrex-guest-program.workspace = true
+libssz.workspace = true
+libssz-types.workspace = true
 
 [[test]]
 name = "ethrex_tests"
