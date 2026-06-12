@@ -558,8 +558,14 @@ impl Blockchain {
         // `--no-bal-parallel-trie` opts out: leave `optimistic_updates = None` so
         // the merkleizer takes the streaming branch (fed by the EVM-side
         // `bal_to_account_updates` send over the channel below).
+        // On eip-8025 / non-rayon builds the parallel BAL executor is compiled
+        // out and `execute_block_pipeline` always takes the sequential path,
+        // which streams per-tx updates over the channel — so optimistic
+        // merkleization must stay off or the channel is never created below.
         let optimistic_updates: Option<FxHashMap<Address, BalSynthesisItem>> =
-            if self.options.bal_parallel_trie_enabled {
+            if cfg!(all(feature = "rayon", not(feature = "eip-8025")))
+                && self.options.bal_parallel_trie_enabled
+            {
                 bal.map(synthesize_bal_updates)
             } else {
                 None

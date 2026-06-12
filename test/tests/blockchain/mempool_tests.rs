@@ -476,6 +476,7 @@ fn blobs_bundle_loadtest() {
             blobs: blobs.to_vec(),
             commitments: commitments.to_vec(),
             proofs: proofs.to_vec(),
+            payload_kzg_proofs: Vec::new(),
             version: 0,
         };
         mempool.add_blobs_bundle(H256::random(), bundle).unwrap();
@@ -500,6 +501,7 @@ fn blobs_bundle_insert_and_remove() {
             blobs: blobs.to_vec(),
             commitments: commitments.to_vec(),
             proofs: proofs.to_vec(),
+            payload_kzg_proofs: Vec::new(),
             version: 0,
         };
         let tx = EIP4844Transaction {

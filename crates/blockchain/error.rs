@@ -67,6 +67,7 @@ impl ChainError {
             ChainError::EvmError(_) => "evm_error",
             ChainError::InvalidTransaction(_) => "invalid_transaction",
             ChainError::WitnessGeneration(_) => "witness_generation",
+            ChainError::BlobsBundle(_) => "blobs_bundle_error",
             ChainError::Custom(_) => "custom_error",
             ChainError::UnknownPayload => "unknown_payload",
         }
