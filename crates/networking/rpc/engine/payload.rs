@@ -939,6 +939,10 @@ fn attach_payload_kzg_proofs(response: &mut ExecutionPayloadResponse) -> Result<
         )
     })?;
 
+    let _proofs_timer = ethrex_metrics::eip8142::METRICS_EIP8142
+        .kzg_duration_seconds
+        .with_label_values(&["proofs"])
+        .start_timer();
     bundle.payload_kzg_proofs = bundle
         .compute_payload_kzg_proofs(payload_blob_count)
         .map_err(|err| RpcErr::Internal(format!("failed to compute payload_kzg_proofs: {err}")))?;
@@ -1439,6 +1443,18 @@ async fn handle_new_payload_v6(
     raw_bal: Option<Bytes>,
     make_witness: bool,
 ) -> Result<PayloadStatus, RpcErr> {
+    // One-shot activation log: `handle_new_payload_v6` is only reached for Bib
+    // (EIP-8142) payloads, so the first call marks the fork going live on this node.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static EIP8142_ACTIVATION_LOGGED: AtomicBool = AtomicBool::new(false);
+    if !EIP8142_ACTIVATION_LOGGED.swap(true, Ordering::Relaxed) {
+        info!(
+            block = block.header.number,
+            timestamp = block.header.timestamp,
+            "EIP-8142 (block-in-blobs) active: processing first newPayloadV6 block"
+        );
+    }
+
     // V4's block access list ordering check still applies.
     if let Some(bal) = &bal
         && let Err(err) = bal.validate_ordering()
@@ -1451,6 +1467,12 @@ async fn handle_new_payload_v6(
     if let Some(status) =
         verify_eip8142_payload(&block, raw_bal.as_deref(), &expected_blob_versioned_hashes)?
     {
+        warn!(
+            block = %block.hash(),
+            payload_blob_count = ?block.header.payload_blob_count,
+            reason = status.validation_error.as_deref().unwrap_or("invalid"),
+            "EIP-8142 newPayloadV6 verification rejected block"
+        );
         return Ok(status);
     }
 
@@ -1468,6 +1490,7 @@ fn verify_eip8142_payload(
         eip8142::execution_payload_to_blobs_from_raw_bal, kzg_commitment_to_versioned_hash,
     };
     use ethrex_crypto::kzg::blob_to_kzg_commitment;
+    use ethrex_metrics::eip8142::METRICS_EIP8142;
 
     let Some(raw_bal) = raw_bal else {
         return Ok(Some(PayloadStatus::invalid_with_err(
@@ -1485,10 +1508,17 @@ fn verify_eip8142_payload(
 
     // payload-blob versioned hashes first, then type-3 transaction blob hashes.
     let mut actual = Vec::with_capacity(payload_blobs.len());
-    for blob in &payload_blobs {
-        let commitment = blob_to_kzg_commitment(blob)
-            .map_err(|err| RpcErr::Internal(format!("KZG commitment failed: {err}")))?;
-        actual.push(kzg_commitment_to_versioned_hash(&commitment));
+    {
+        // Time the payload-blob commitment recompute (MSM) — fires every Bib block.
+        let _commit_timer = METRICS_EIP8142
+            .kzg_duration_seconds
+            .with_label_values(&["commit"])
+            .start_timer();
+        for blob in &payload_blobs {
+            let commitment = blob_to_kzg_commitment(blob)
+                .map_err(|err| RpcErr::Internal(format!("KZG commitment failed: {err}")))?;
+            actual.push(kzg_commitment_to_versioned_hash(&commitment));
+        }
     }
     actual.extend(
         block

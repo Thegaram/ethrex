@@ -882,6 +882,42 @@ impl Blockchain {
                 );
             }
 
+            metrics!({
+                use ethrex_common::types::eip8142::{
+                    HEADER_SIZE, execution_payload_data_section_lens, last_blob_utilization,
+                };
+                use ethrex_metrics::eip8142::METRICS_EIP8142;
+
+                let payload_count = payload_blobs.len();
+                let total_blobs = context.blobs_bundle.blobs.len();
+                let (bal_len, txs_len) = execution_payload_data_section_lens(
+                    block_access_list,
+                    &context.payload.body.transactions,
+                );
+                let data_len = HEADER_SIZE + bal_len + txs_len;
+
+                METRICS_EIP8142.payload_bal_bytes.set(bal_len as i64);
+                METRICS_EIP8142.payload_txs_bytes.set(txs_len as i64);
+                METRICS_EIP8142.active.set(1);
+                METRICS_EIP8142.payload_blob_count.observe(payload_count as f64);
+                METRICS_EIP8142
+                    .payload_blob_count_last
+                    .set(payload_count as i64);
+                METRICS_EIP8142
+                    .blobs_total
+                    .with_label_values(&["payload"])
+                    .inc_by(payload_count as u64);
+                METRICS_EIP8142
+                    .blobs_total
+                    .with_label_values(&["type3"])
+                    .inc_by(total_blobs.saturating_sub(payload_count) as u64);
+                METRICS_EIP8142.block_blobs.set(total_blobs as i64);
+                METRICS_EIP8142.max_blobs.set(max_blobs as i64);
+                METRICS_EIP8142
+                    .last_payload_blob_utilization
+                    .set(last_blob_utilization(data_len, payload_count));
+            });
+
             Ok(())
         }
     }
@@ -932,6 +968,22 @@ impl Blockchain {
         {
             self.add_eip8142_payload_blobs(context)?;
         }
+
+        // Blob-count metrics for EVERY block (all forks): total blobs, MAX_BLOBS, and
+        // payload-blob count (0 pre-8142). Lets the dashboard show max/user blobs before
+        // activation. Payload-specific metrics live in add_eip8142_payload_blobs.
+        metrics!({
+            use ethrex_metrics::eip8142::METRICS_EIP8142;
+            METRICS_EIP8142
+                .max_blobs
+                .set(self.effective_max_blobs(context) as i64);
+            METRICS_EIP8142
+                .block_blobs
+                .set(context.blobs_bundle.blobs.len() as i64);
+            METRICS_EIP8142
+                .payload_blob_count_last
+                .set(context.payload.header.payload_blob_count.unwrap_or(0) as i64);
+        });
 
         let mut logs = vec![];
         for receipt in context.receipts.iter().cloned() {

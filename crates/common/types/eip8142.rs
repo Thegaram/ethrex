@@ -20,7 +20,7 @@ const USABLE_BYTES_PER_BLOB: usize = SAFE_BYTES_PER_BLOB;
 /// Width of each big-endian `u32` length prefix in the packed payload header.
 const LENGTH_PREFIX_SIZE: usize = 4;
 /// Packed payload header: BAL length + transactions length.
-const HEADER_SIZE: usize = 2 * LENGTH_PREFIX_SIZE;
+pub const HEADER_SIZE: usize = 2 * LENGTH_PREFIX_SIZE;
 
 /// The subset of an execution payload published via blobs under EIP-8142.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -84,6 +84,48 @@ pub fn execution_payload_to_blobs_from_raw_bal(
     transactions: &Vec<Transaction>,
 ) -> Vec<Blob> {
     payload_parts_to_blobs(bal_bytes, &transactions.encode_to_vec())
+}
+
+/// Byte length of the packed payload data — the 8-byte length header plus the
+/// RLP-encoded block access list and transactions — i.e. the unpadded bytes that
+/// [`execution_payload_data_to_blobs`] packs into blobs. Recomputes the section
+/// encodings, so this is for off-hot-path use (metrics), not block building.
+pub fn execution_payload_data_byte_len(
+    block_access_list: &BlockAccessList,
+    transactions: &Vec<Transaction>,
+) -> usize {
+    let (bal_len, txs_len) = execution_payload_data_section_lens(block_access_list, transactions);
+    HEADER_SIZE + bal_len + txs_len
+}
+
+/// RLP-encoded byte lengths of the two packed payload-data sections, `(bal_len,
+/// txs_len)` — the same bytes [`execution_payload_data_to_blobs`] packs after the
+/// 8-byte header. For observability (size breakdown), so it recomputes the section
+/// encodings and is not for the block-building hot path.
+pub fn execution_payload_data_section_lens(
+    block_access_list: &BlockAccessList,
+    transactions: &Vec<Transaction>,
+) -> (usize, usize) {
+    (
+        block_access_list.encode_to_vec().len(),
+        transactions.encode_to_vec().len(),
+    )
+}
+
+/// Fill fraction (in `(0.0, 1.0]`) of the *trailing* payload blob. Every payload
+/// blob but the last is full by construction (the encoder chunks at
+/// `USABLE_BYTES_PER_BLOB`), so the last blob's fill is the padding-waste signal:
+/// `(1.0 - utilization) * USABLE_BYTES_PER_BLOB` is the wasted bytes. `data_len`
+/// is the packed payload length; `blob_count` the number of payload blobs.
+pub fn last_blob_utilization(data_len: usize, blob_count: usize) -> f64 {
+    if blob_count == 0 {
+        return 0.0;
+    }
+    let leading_capacity = blob_count.saturating_sub(1) * USABLE_BYTES_PER_BLOB;
+    let last_blob_bytes = data_len
+        .saturating_sub(leading_capacity)
+        .min(USABLE_BYTES_PER_BLOB);
+    last_blob_bytes as f64 / USABLE_BYTES_PER_BLOB as f64
 }
 
 /// Decodes blobs produced by [`execution_payload_data_to_blobs`] back into the
@@ -198,6 +240,19 @@ mod tests {
         // Decoding yields the data zero-padded to a whole number of blobs.
         assert_eq!(&raw[..data.len()], &data[..]);
         assert!(raw[data.len()..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn last_blob_utilization_cases() {
+        let cap = USABLE_BYTES_PER_BLOB;
+        // Empty payload = 8-byte header only -> 1 blob, barely used.
+        assert_eq!(last_blob_utilization(8, 1), 8.0 / cap as f64);
+        // Exact multiple -> trailing blob is full.
+        assert_eq!(last_blob_utilization(2 * cap, 2), 1.0);
+        // 3 blobs, 100 bytes spill into the last -> low utilization.
+        assert_eq!(last_blob_utilization(2 * cap + 100, 3), 100.0 / cap as f64);
+        // Defensive: zero count never divides by zero or panics.
+        assert_eq!(last_blob_utilization(0, 0), 0.0);
     }
 
     #[test]
