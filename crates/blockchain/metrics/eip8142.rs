@@ -44,6 +44,17 @@ pub struct MetricsEip8142 {
     /// `blob_to_kzg_commitment` MSM, hot path) and "proofs" (zk getPayload,
     /// `compute_payload_kzg_proofs`).
     pub kzg_duration_seconds: HistogramVec,
+    /// getPayload build duration by `phase`: "fill_transactions" (EVM exec + selection),
+    /// "encode" (BAL+txs → payload blobs), "build_bundle" (KZG commitments + cell proofs).
+    /// `build_bundle` is also under `kzg_duration_seconds`; kept here so all three phases
+    /// share one histogram.
+    pub build_phase_seconds: HistogramVec,
+    /// Cheap incremental upper-bound estimate of the BAL byte size of the most recent
+    /// built block (`estimated_encoded_len`, what tx selection gates on).
+    pub bal_estimated_size_bytes: IntGauge,
+    /// Exact BAL byte size of the most recent built block. Together with
+    /// `bal_estimated_size_bytes` this exposes the estimate↔real gap (the gate's slack).
+    pub bal_actual_size_bytes: IntGauge,
 }
 
 impl Default for MetricsEip8142 {
@@ -111,6 +122,25 @@ impl MetricsEip8142 {
                     .expect("Invalid eip8142 KZG histogram bucket params")
             )
             .expect("Failed to create eip8142_kzg_duration_seconds metric"),
+            build_phase_seconds: register_histogram_vec!(
+                "eip8142_build_phase_seconds",
+                "Duration of getPayload build phases by phase (fill_transactions / encode / build_bundle)",
+                &["phase"],
+                // ~100us .. ~3s, doubling: covers a fast encode up to a slow full build.
+                exponential_buckets(0.0001, 2.0, 16)
+                    .expect("Invalid eip8142 build-phase histogram bucket params")
+            )
+            .expect("Failed to create eip8142_build_phase_seconds metric"),
+            bal_estimated_size_bytes: register_int_gauge!(
+                "eip8142_bal_estimated_size_bytes",
+                "Cheap incremental upper-bound estimate of BAL bytes at the most recent exact measurement"
+            )
+            .expect("Failed to create eip8142_bal_estimated_size_bytes metric"),
+            bal_actual_size_bytes: register_int_gauge!(
+                "eip8142_bal_actual_size_bytes",
+                "Exact BAL bytes at the most recent exact measurement"
+            )
+            .expect("Failed to create eip8142_bal_actual_size_bytes metric"),
         }
     }
 }

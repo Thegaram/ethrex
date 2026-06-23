@@ -1430,6 +1430,14 @@ impl Transaction {
         }
     }
 
+    /// Number of blob versioned hashes (= blob count) without cloning them.
+    pub fn blob_versioned_hashes_len(&self) -> usize {
+        match self {
+            Transaction::EIP4844Transaction(tx) => tx.blob_versioned_hashes.len(),
+            _ => 0,
+        }
+    }
+
     pub fn max_fee_per_blob_gas(&self) -> Option<U256> {
         match self {
             Transaction::LegacyTransaction(_) => None,

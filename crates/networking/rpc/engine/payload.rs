@@ -1507,19 +1507,25 @@ fn verify_eip8142_payload(
     }
 
     // payload-blob versioned hashes first, then type-3 transaction blob hashes.
-    let mut actual = Vec::with_capacity(payload_blobs.len());
-    {
-        // Time the payload-blob commitment recompute (MSM) — fires every Bib block.
+    let mut actual = {
+        // One commitment MSM per payload blob (op=commit), independent, so parallelize
+        // across rayon threads — serial, this drove newPayload p95 up with blob count.
+        // Host-only crate (never the zkVM guest), so no eip-8025 gating; `collect`
+        // preserves payload-first order for the versioned-hash comparison.
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
         let _commit_timer = METRICS_EIP8142
             .kzg_duration_seconds
             .with_label_values(&["commit"])
             .start_timer();
-        for blob in &payload_blobs {
-            let commitment = blob_to_kzg_commitment(blob)
-                .map_err(|err| RpcErr::Internal(format!("KZG commitment failed: {err}")))?;
-            actual.push(kzg_commitment_to_versioned_hash(&commitment));
-        }
-    }
+        payload_blobs
+            .par_iter()
+            .map(|blob| {
+                let commitment = blob_to_kzg_commitment(blob)
+                    .map_err(|err| RpcErr::Internal(format!("KZG commitment failed: {err}")))?;
+                Ok(kzg_commitment_to_versioned_hash(&commitment))
+            })
+            .collect::<Result<Vec<H256>, RpcErr>>()?
+    };
     actual.extend(
         block
             .body

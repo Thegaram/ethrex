@@ -97,37 +97,74 @@ impl BlobsBundle {
 
     // In the future we might want to provide a new method that calculates the commitments and proofs using the following.
     #[cfg(feature = "c-kzg")]
+    /// Build path: per-blob cell-proof MSMs are independent and dominate getPayload
+    /// latency under EIP-8142, so compute them across rayon threads.
+    #[cfg(all(feature = "rayon", not(feature = "eip-8025")))]
     pub fn create_from_blobs(
         blobs: &Vec<Blob>,
         wrapper_version: Option<u8>,
     ) -> Result<Self, BlobsBundleError> {
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+        let version = wrapper_version.unwrap_or(0);
+        let per_blob = blobs
+            .par_iter()
+            .map(|blob| Self::blob_commitment_and_proofs(blob, version))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::bundle_from_per_blob(blobs, version, per_blob))
+    }
+
+    /// Guest/zkVM (`eip-8025`) or no `rayon`: deterministic serial form.
+    #[cfg(any(feature = "eip-8025", not(feature = "rayon")))]
+    pub fn create_from_blobs(
+        blobs: &Vec<Blob>,
+        wrapper_version: Option<u8>,
+    ) -> Result<Self, BlobsBundleError> {
+        let version = wrapper_version.unwrap_or(0);
+        let per_blob = blobs
+            .iter()
+            .map(|blob| Self::blob_commitment_and_proofs(blob, version))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::bundle_from_per_blob(blobs, version, per_blob))
+    }
+
+    /// One blob's commitment and proof(s): a single proof for wrapper version 0,
+    /// EIP-7594 cell proofs otherwise.
+    fn blob_commitment_and_proofs(
+        blob: &Blob,
+        version: u8,
+    ) -> Result<(Commitment, Vec<Proof>), BlobsBundleError> {
         use ethrex_crypto::kzg::{
             blob_to_commitment_and_cell_proofs, blob_to_kzg_commitment_and_proof,
         };
-        let mut commitments = Vec::new();
-        let mut proofs = Vec::new();
-
-        // Populate the commitments and proofs
-        for blob in blobs {
-            if wrapper_version.unwrap_or(0) == 0 {
-                let (commitment, proof) = blob_to_kzg_commitment_and_proof(blob)?;
-                commitments.push(commitment);
-                proofs.push(proof);
-            } else {
-                let (commitment, cell_proofs) = blob_to_commitment_and_cell_proofs(blob)?;
-                commitments.push(commitment);
-                proofs.extend(cell_proofs);
-            }
+        if version == 0 {
+            let (commitment, proof) = blob_to_kzg_commitment_and_proof(blob)?;
+            Ok((commitment, vec![proof]))
+        } else {
+            let (commitment, cell_proofs) = blob_to_commitment_and_cell_proofs(blob)?;
+            Ok((commitment, cell_proofs))
         }
+    }
 
-        Ok(Self {
-            blobs: blobs.clone(),
+    /// Assemble a bundle, flattening per-blob proofs in blob order so commitments
+    /// stay 1:1 with blobs and proofs remain aligned for downstream slicing.
+    fn bundle_from_per_blob(
+        blobs: &[Blob],
+        version: u8,
+        per_blob: Vec<(Commitment, Vec<Proof>)>,
+    ) -> Self {
+        let mut commitments = Vec::with_capacity(per_blob.len());
+        let mut proofs = Vec::new();
+        for (commitment, blob_proofs) in per_blob {
+            commitments.push(commitment);
+            proofs.extend(blob_proofs);
+        }
+        Self {
+            blobs: blobs.to_vec(),
             commitments,
             proofs,
-            // `payload_kzg_proofs` are computed later if needed.
             payload_kzg_proofs: Vec::new(),
-            version: wrapper_version.unwrap_or(0),
-        })
+            version,
+        }
     }
 
     pub fn generate_versioned_hashes(&self) -> Vec<H256> {

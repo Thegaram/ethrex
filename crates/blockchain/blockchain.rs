@@ -2121,11 +2121,12 @@ impl Blockchain {
             warmer_duration,
         ) = { self.execute_block_pipeline(&block, &parent_header, &mut vm, bal, collect_witness)? };
 
-        let (gas_used, gas_limit, block_number, transactions_count) = (
+        let (gas_used, gas_limit, block_number, transactions_count, payload_blob_count) = (
             block.header.gas_used,
             block.header.gas_limit,
             block.header.number,
             block.body.transactions.len(),
+            block.header.payload_blob_count,
         );
         let block_hash = block.hash();
 
@@ -2167,6 +2168,54 @@ impl Blockchain {
             warn!("Failed to store block access list for block {block_hash}: {err}");
         }
 
+        // EIP-8142: record the block's blob/payload shape on *import*, so these
+        // network-wide metrics are reported by every node for every canonical block
+        // (the builder-side recording in `add_eip8142_payload_blobs` only covers the
+        // proposer). The BAL bytes come from this node's own `produced_bal` (or the
+        // validated incoming `bal`). Block-building-specific metrics stay builder-side.
+        metrics!({
+            use ethrex_common::types::eip8142::{HEADER_SIZE, last_blob_utilization};
+            use ethrex_metrics::eip8142::METRICS_EIP8142;
+            let config = self.storage.get_chain_config();
+            if config.is_eip8142_activated(block.header.timestamp)
+                && let Some(payload_blob_count) = block.header.payload_blob_count
+            {
+                let payload_blob_count = payload_blob_count as usize;
+                let type3_blobs: usize = block
+                    .body
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.blob_versioned_hashes_len())
+                    .sum();
+                let max_blobs = config
+                    .get_fork_blob_schedule(block.header.timestamp)
+                    .map(|schedule| schedule.max as usize)
+                    .unwrap_or(0);
+                let bal_len = produced_bal
+                    .as_ref()
+                    .or(bal)
+                    .map(|b| b.length())
+                    .unwrap_or(0);
+                let txs_len = block.body.transactions.encode_to_vec().len();
+                METRICS_EIP8142.active.set(1);
+                METRICS_EIP8142
+                    .payload_blob_count_last
+                    .set(payload_blob_count as i64);
+                METRICS_EIP8142
+                    .block_blobs
+                    .set((payload_blob_count + type3_blobs) as i64);
+                METRICS_EIP8142.max_blobs.set(max_blobs as i64);
+                METRICS_EIP8142.payload_bal_bytes.set(bal_len as i64);
+                METRICS_EIP8142.payload_txs_bytes.set(txs_len as i64);
+                METRICS_EIP8142
+                    .last_payload_blob_utilization
+                    .set(last_blob_utilization(
+                        HEADER_SIZE + bal_len + txs_len,
+                        payload_blob_count,
+                    ));
+            }
+        });
+
         let result = self.store_block(block, account_updates_list, res);
 
         let stored = Instant::now();
@@ -2186,6 +2235,7 @@ impl Blockchain {
                 block_number,
                 block_hash,
                 transactions_count,
+                payload_blob_count,
                 merkle_queue_length,
                 warmer_duration,
                 instants,
@@ -2267,6 +2317,7 @@ impl Blockchain {
         block_number: u64,
         block_hash: H256,
         transactions_count: usize,
+        payload_blob_count: Option<u64>,
         merkle_queue_length: usize,
         warmer_duration: Duration,
         [
@@ -2352,16 +2403,24 @@ impl Blockchain {
         // Helper for percentage
         let pct = |ms: f64| (ms / total_ms * 100.0).round() as u64;
 
+        // EIP-8142 "block-in-blobs": append the payload-blob count so it shows in the log stream.
+        // Omitted pre-fork (field is None), so non-EIP-8142 lines are unchanged.
+        let payload_blobs_suffix = match payload_blob_count {
+            Some(count) => format!(" | {count} payload blobs"),
+            None => String::new(),
+        };
+
         // Format output
         let header = format!(
-            "[METRIC] BLOCK {} {:#x} | {:.3} Ggas/s | {:.2} ms | {} txs | {:.0} Mgas ({}%)",
+            "[METRIC] BLOCK {} {:#x} | {:.3} Ggas/s | {:.2} ms | {} txs | {:.0} Mgas ({}%){}",
             block_number,
             block_hash,
             throughput,
             total_ms,
             transactions_count,
             as_mgas,
-            (gas_used as f64 / gas_limit as f64 * 100.0).round() as u64
+            (gas_used as f64 / gas_limit as f64 * 100.0).round() as u64,
+            payload_blobs_suffix,
         );
 
         let bottleneck_marker = |name: &str| {

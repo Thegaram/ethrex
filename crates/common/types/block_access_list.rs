@@ -752,7 +752,30 @@ pub struct TxCheckpoint {
     storage_reads_lens: IndexMap<Address, usize>,
     initial_balances_len: usize,
     addresses_with_initial_code_len: usize,
+    estimated_content_len: usize,
 }
+
+// Conservative RLP-size upper bounds for the incremental BAL-length estimate
+// (`estimated_encoded_len`). Each is an over-estimate of the encoded size of one
+// element, so summing them can only over-state the real length — exactly the
+// direction a *seal* decision needs (over-estimate ⇒ seal early ⇒ never exceed).
+/// Per touched address: 20-byte address + the `AccountChanges` list header + its
+/// five (possibly empty) sub-list headers, at worst-case header widths.
+const EST_ACCOUNT_OVERHEAD: usize = 51;
+/// One storage *read* slot (a `U256`, ≤ 33 RLP bytes).
+const EST_READ_SLOT_BYTES: usize = 33;
+/// One `StorageChange` `(block_access_index, post_value)` entry.
+const EST_STORAGE_CHANGE_BYTES: usize = 40;
+/// First write to a slot: the `SlotChange` framing (slot + nested list headers).
+const EST_NEW_WRITE_SLOT_OVERHEAD: usize = 43;
+/// One `BalanceChange` entry.
+const EST_BALANCE_CHANGE_BYTES: usize = 40;
+/// One `NonceChange` entry.
+const EST_NONCE_CHANGE_BYTES: usize = 16;
+/// One `CodeChange` entry, excluding the code bytes themselves.
+const EST_CODE_CHANGE_OVERHEAD: usize = 16;
+/// The outer `BlockAccessList` list header.
+const EST_OUTER_OVERHEAD: usize = 8;
 
 /// Records state accesses during block execution to build a Block Access List (EIP-7928).
 ///
@@ -805,6 +828,15 @@ pub struct BlockAccessListRecorder {
     /// Set during system contract calls (EIP-2935, EIP-4788, etc.) where the
     /// system address account is backed up and restored, so changes are transient.
     in_system_call: bool,
+    /// Running upper-bound estimate of the encoded byte length of the *variable*
+    /// (per-element) BAL content — storage reads/writes, balance/nonce/code changes —
+    /// maintained incrementally as those are recorded. Increment-only: net-zero
+    /// filtering and checkpoint/restore are *not* reflected, so this can only
+    /// over-state the retained content (kept a sound upper bound on purpose; see
+    /// [`estimated_encoded_len`](Self::estimated_encoded_len)). The per-account
+    /// framing is added at read time from `touched_addresses.len()`, so the many
+    /// address-touch sites need no instrumentation.
+    estimated_content_len: usize,
 }
 
 impl BlockAccessListRecorder {
@@ -1006,7 +1038,10 @@ impl BlockAccessListRecorder {
         {
             return;
         }
-        self.storage_reads.entry(address).or_default().insert(slot);
+        if self.storage_reads.entry(address).or_default().insert(slot) {
+            // Count only genuinely new read slots (repeat reads don't grow the BAL).
+            self.estimated_content_len += EST_READ_SLOT_BYTES;
+        }
         // Also mark the address as touched
         self.touched_addresses.insert(address);
     }
@@ -1036,14 +1071,20 @@ impl BlockAccessListRecorder {
         // This is necessary for correct checkpoint/restore semantics:
         // restore() truncates the vector by length, so in-place updates
         // would corrupt values that should be preserved after a revert.
-        let changes = self
-            .storage_writes
-            .entry(address)
-            .or_default()
-            .entry(slot)
-            .or_default();
+        let slot_entry = self.storage_writes.entry(address).or_default().entry(slot);
+        let new_slot = matches!(slot_entry, std::collections::btree_map::Entry::Vacant(_));
+        let changes = slot_entry.or_default();
 
         changes.push((self.current_index, post_value));
+        // Increment-only upper bound: every recorded write grows the raw structure
+        // (net-zero collapse happens later in `build`), plus the slot's framing the
+        // first time it's written.
+        self.estimated_content_len += EST_STORAGE_CHANGE_BYTES
+            + if new_slot {
+                EST_NEW_WRITE_SLOT_OVERHEAD
+            } else {
+                0
+            };
         // Mark address as touched (include SYSTEM_ADDRESS for actual state changes)
         self.touched_addresses.insert(address);
     }
@@ -1081,6 +1122,7 @@ impl BlockAccessListRecorder {
         // The last entry for each transaction will be used in build().
         let changes = self.balance_changes.entry(address).or_default();
         changes.push((self.current_index, post_balance));
+        self.estimated_content_len += EST_BALANCE_CHANGE_BYTES;
 
         // Mark address as touched
         self.touched_addresses.insert(address);
@@ -1114,6 +1156,7 @@ impl BlockAccessListRecorder {
             .entry(address)
             .or_default()
             .push((self.current_index, post_nonce));
+        self.estimated_content_len += EST_NONCE_CHANGE_BYTES;
         // Mark address as touched
         self.touched_addresses.insert(address);
     }
@@ -1150,6 +1193,7 @@ impl BlockAccessListRecorder {
             return;
         }
 
+        self.estimated_content_len += EST_CODE_CHANGE_OVERHEAD + new_code.len();
         self.code_changes
             .entry(address)
             .or_default()
@@ -1163,6 +1207,39 @@ impl BlockAccessListRecorder {
         for address in addresses {
             self.record_touched_address(address);
         }
+    }
+
+    /// Cheap O(1) **upper bound** on the encoded byte length of the block access
+    /// list this recorder would currently produce. Maintained incrementally as
+    /// state is recorded (see [`estimated_content_len`](Self::estimated_content_len))
+    /// plus per-account framing derived from the touched-address count — no clone,
+    /// build, or sort.
+    ///
+    /// The EIP-8142 builder gates transaction selection on this directly — it never
+    /// re-measures the whole BAL on the hot path. Because it is a sound upper bound, a
+    /// fit here guarantees the real (exact) length fits too, so the builder's finalize
+    /// check can't be tripped by selection. `record_*` keep it accurate per-tx (each
+    /// bumps it by the element's worst-case RLP size); [`tx_restore`](Self::tx_restore)
+    /// rolls it back with the rest of the recorder for rejected txs.
+    ///
+    /// It can over-state the real length — net-zero-filtered writes are not subtracted,
+    /// repeated same-slot writes are each counted, and header widths are worst-cased — so
+    /// the gap to [`encoded_len`](Self::encoded_len) widens for write-heavy blocks. That
+    /// only makes selection seal a little under the true cap; it never under-counts.
+    pub fn estimated_encoded_len(&self) -> usize {
+        EST_OUTER_OVERHEAD
+            + self.touched_addresses.len() * EST_ACCOUNT_OVERHEAD
+            + self.estimated_content_len
+    }
+
+    /// Exact RLP-encoded byte length of the block access list this recorder would
+    /// currently produce, via the canonical encoder ([`build`](Self::build) +
+    /// [`RLPEncode::length`]) — so it can never drift from the real encoding. Costs a
+    /// clone + build of the current BAL, i.e. O(current BAL size); used only as the
+    /// reference oracle in tests that bound [`estimated_encoded_len`](Self::estimated_encoded_len),
+    /// never on the block-building hot path.
+    pub fn encoded_len(&self) -> usize {
+        self.clone().build().length()
     }
 
     /// Builds the final BlockAccessList from accumulated data.
@@ -1461,6 +1538,7 @@ impl BlockAccessListRecorder {
                 .collect(),
             initial_balances_len: self.initial_balances.len(),
             addresses_with_initial_code_len: self.addresses_with_initial_code.len(),
+            estimated_content_len: self.estimated_content_len,
         }
     }
 
@@ -1471,6 +1549,10 @@ impl BlockAccessListRecorder {
     /// all state changes.
     pub fn tx_restore(&mut self, checkpoint: TxCheckpoint) {
         self.current_index = checkpoint.current_index;
+        // Undo the rejected tx's contribution to the incremental size estimate, so a
+        // rejected tx leaves the running upper bound exactly where it was pre-tx (the
+        // EIP-8142 builder gate relies on this to not drift up near the blob cap).
+        self.estimated_content_len = checkpoint.estimated_content_len;
 
         // Truncate append-only IndexSet/IndexMap fields to their checkpoint lengths
         self.touched_addresses
@@ -1786,6 +1868,158 @@ mod synthesize_tests {
 
     fn make_bal(account: AccountChanges) -> BlockAccessList {
         BlockAccessList::from_accounts(vec![account])
+    }
+
+    /// `encoded_len` must equal the real RLP byte length of the BAL the recorder
+    /// builds — including a code change (the gas-unbounded term a fixed reservation
+    /// can't bound) — and the cheap `estimated_encoded_len` must be a sound upper
+    /// bound on it. These are what let the EIP-8142 builder gate cheaply and measure
+    /// precisely only near the limit.
+    #[test]
+    fn encoded_len_matches_built_bal_and_estimate_bounds_it() {
+        let mut recorder = BlockAccessListRecorder::new();
+        recorder.set_block_access_index(1);
+        recorder.record_touched_address(addr(1));
+        recorder.record_storage_write(addr(1), U256::from(7), U256::from(99));
+        recorder.record_storage_read(addr(2), U256::from(3));
+        recorder.record_balance_change(addr(2), U256::from(1_000_000u64));
+        recorder.record_code_change(addr(3), Bytes::from(vec![0xabu8; 4096]));
+
+        let exact = recorder.encoded_len();
+        let actual = recorder.clone().build().encode_to_vec().len();
+        assert_eq!(exact, actual);
+        // The 4 KiB code change must dominate, confirming code bytes are counted.
+        assert!(exact > 4096, "code bytes not reflected: {exact}");
+        // The cheap incremental estimate must never under-count the exact length.
+        assert!(
+            recorder.estimated_encoded_len() >= exact,
+            "estimate {} < exact {exact}",
+            recorder.estimated_encoded_len(),
+        );
+    }
+
+    /// A rejected transaction must not drift the incremental size estimate:
+    /// `tx_restore` rolls `estimated_encoded_len` back to its pre-tx value. The
+    /// EIP-8142 builder gate relies on this so the running upper bound doesn't creep
+    /// upward as it rejects candidates near the blob cap.
+    #[test]
+    fn tx_restore_rolls_back_estimated_len() {
+        let mut recorder = BlockAccessListRecorder::new();
+        recorder.set_block_access_index(1);
+        recorder.record_storage_write(addr(1), U256::from(1), U256::from(2));
+        let before = recorder.estimated_encoded_len();
+
+        // A second tx records more (new account, storage, 1 KiB of code), then is
+        // rejected and rolled back via the per-tx checkpoint.
+        let checkpoint = recorder.tx_checkpoint();
+        recorder.set_block_access_index(2);
+        recorder.record_storage_write(addr(2), U256::from(3), U256::from(4));
+        recorder.record_code_change(addr(3), Bytes::from(vec![0u8; 1000]));
+        assert!(recorder.estimated_encoded_len() > before);
+
+        recorder.tx_restore(checkpoint);
+        assert_eq!(recorder.estimated_encoded_len(), before);
+    }
+
+    /// The incremental estimate must stay a sound upper bound at the *value*
+    /// boundaries Codex flagged: a `u32::MAX` block-access index (5-byte RLP), a
+    /// `U256::MAX` slot/value/balance (33-byte RLP), and a `u64::MAX` nonce (9-byte
+    /// RLP). Each change type is exercised in isolation at its widest encoding so a
+    /// per-element constant that under-budgets at max width is caught here, not on a
+    /// live block. Filtering only shrinks the exact length, so `estimate >= exact`
+    /// is the whole contract.
+    #[test]
+    fn estimate_bounds_exact_at_value_boundaries() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut BlockAccessListRecorder)>)> = vec![
+            (
+                "max storage write",
+                Box::new(|r: &mut BlockAccessListRecorder| {
+                    r.record_storage_write(addr(1), U256::MAX, U256::MAX)
+                }),
+            ),
+            (
+                "max storage read",
+                Box::new(|r: &mut BlockAccessListRecorder| r.record_storage_read(addr(1), U256::MAX)),
+            ),
+            (
+                "max balance change",
+                Box::new(|r: &mut BlockAccessListRecorder| {
+                    r.record_balance_change(addr(1), U256::MAX)
+                }),
+            ),
+            (
+                "max nonce change",
+                Box::new(|r: &mut BlockAccessListRecorder| {
+                    r.record_nonce_change(addr(1), u64::MAX)
+                }),
+            ),
+            (
+                "max code change",
+                Box::new(|r: &mut BlockAccessListRecorder| {
+                    r.record_code_change(addr(1), Bytes::from(vec![0xff; 24_576]))
+                }),
+            ),
+        ];
+        for (name, record) in cases {
+            let mut recorder = BlockAccessListRecorder::new();
+            // u32::MAX index ⇒ the block_access_index field is at its widest (5 bytes).
+            recorder.set_block_access_index(u32::MAX);
+            recorder.record_touched_address(addr(1));
+            record(&mut recorder);
+            let exact = recorder.encoded_len();
+            let estimate = recorder.estimated_encoded_len();
+            assert!(estimate >= exact, "{name}: estimate {estimate} < exact {exact}");
+        }
+    }
+
+    /// Large per-account lists push the sub-list (and `AccountChanges`) RLP headers
+    /// across the short→long boundaries (1→2→3 byte length prefixes). The per-account
+    /// framing budget (`EST_ACCOUNT_OVERHEAD`) must cover the widest headers even when
+    /// every element is at max width (minimal per-element slack). Stress all five
+    /// sub-lists at once with hundreds of `U256::MAX`/`u32::MAX` entries plus a big
+    /// code change, and assert the estimate still bounds the exact length.
+    #[test]
+    fn estimate_bounds_exact_with_long_rlp_headers() {
+        let mut recorder = BlockAccessListRecorder::new();
+        recorder.set_block_access_index(u32::MAX);
+        recorder.record_touched_address(addr(1));
+        // ~500 distinct max-value entries per list ⇒ multi-KiB sub-lists ⇒ 3-byte headers.
+        for i in 0..500u64 {
+            let slot = U256::MAX - U256::from(i);
+            recorder.record_storage_write(addr(1), slot, U256::MAX);
+            recorder.record_storage_read(addr(1), U256::from(i)); // distinct read slots
+            recorder.record_balance_change(addr(1), U256::MAX - U256::from(i));
+            recorder.record_nonce_change(addr(1), u64::MAX - i);
+        }
+        recorder.record_code_change(addr(1), Bytes::from(vec![0xab; 24_576]));
+        // A second touched account, also large, to widen the outer list header too.
+        recorder.record_touched_address(addr(2));
+        for i in 0..500u64 {
+            recorder.record_storage_write(addr(2), U256::from(i), U256::MAX - U256::from(i));
+        }
+        let exact = recorder.encoded_len();
+        let estimate = recorder.estimated_encoded_len();
+        assert!(estimate >= exact, "long-header case: estimate {estimate} < exact {exact}");
+    }
+
+    /// Repeated writes to the *same* slot are each counted by the increment-only
+    /// estimate but deduped per index by `build`, and repeated balance/nonce changes
+    /// across indices accumulate. Either way the estimate must remain an upper bound
+    /// (here it over-counts — exactly the conservative direction).
+    #[test]
+    fn estimate_bounds_exact_repeated_writes() {
+        let mut recorder = BlockAccessListRecorder::new();
+        recorder.record_touched_address(addr(1));
+        for idx in 1..=200u32 {
+            recorder.set_block_access_index(idx);
+            // Same slot rewritten every tx; same account balance/nonce bumped every tx.
+            recorder.record_storage_write(addr(1), U256::from(7), U256::from(idx));
+            recorder.record_balance_change(addr(1), U256::from(idx));
+            recorder.record_nonce_change(addr(1), idx as u64);
+        }
+        let exact = recorder.encoded_len();
+        let estimate = recorder.estimated_encoded_len();
+        assert!(estimate >= exact, "repeated-write case: estimate {estimate} < exact {exact}");
     }
 
     /// Accounts with only `storage_reads` must be skipped entirely.

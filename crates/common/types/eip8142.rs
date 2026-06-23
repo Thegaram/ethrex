@@ -98,6 +98,17 @@ pub fn execution_payload_data_byte_len(
     HEADER_SIZE + bal_len + txs_len
 }
 
+/// Number of payload blobs the EIP-8142 codec emits for a packed payload-data
+/// section of `data_len` bytes (the 8-byte length header + RLP block access list
+/// + RLP transactions): `ceil(data_len / USABLE_BYTES_PER_BLOB)`.
+///
+/// Used by the block builder to project the payload-blob count *before* the BAL
+/// is finalized, so transaction selection can keep the combined
+/// `payload_blob_count + type-3 blobs` count within `MAX_BLOBS_PER_BLOCK`.
+pub fn payload_blob_count_for_byte_len(data_len: usize) -> usize {
+    data_len.div_ceil(USABLE_BYTES_PER_BLOB)
+}
+
 /// RLP-encoded byte lengths of the two packed payload-data sections, `(bal_len,
 /// txs_len)` — the same bytes [`execution_payload_data_to_blobs`] packs after the
 /// 8-byte header. For observability (size breakdown), so it recomputes the section
@@ -240,6 +251,24 @@ mod tests {
         // Decoding yields the data zero-padded to a whole number of blobs.
         assert_eq!(&raw[..data.len()], &data[..]);
         assert!(raw[data.len()..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn payload_blob_count_for_byte_len_cases() {
+        let cap = USABLE_BYTES_PER_BLOB;
+        // Empty data needs zero blobs; any data up to one blob's capacity needs one.
+        assert_eq!(payload_blob_count_for_byte_len(0), 0);
+        assert_eq!(payload_blob_count_for_byte_len(1), 1);
+        assert_eq!(payload_blob_count_for_byte_len(cap), 1);
+        // One byte over a boundary rolls into the next blob.
+        assert_eq!(payload_blob_count_for_byte_len(cap + 1), 2);
+        assert_eq!(payload_blob_count_for_byte_len(3 * cap), 3);
+        // Agrees with the actual encoder for a multi-blob payload.
+        let data = vec![0u8; 2 * cap + 1234];
+        assert_eq!(
+            payload_blob_count_for_byte_len(data.len()),
+            bytes_to_blobs(&data).len()
+        );
     }
 
     #[test]
