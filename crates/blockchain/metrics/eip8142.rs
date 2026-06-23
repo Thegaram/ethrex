@@ -1,59 +1,36 @@
 use prometheus::{
-    Gauge, Histogram, HistogramVec, IntCounterVec, IntGauge, exponential_buckets, register_gauge,
-    register_histogram, register_histogram_vec, register_int_counter_vec, register_int_gauge,
+    Gauge, HistogramVec, IntGauge, exponential_buckets, register_gauge, register_histogram_vec,
+    register_int_gauge,
 };
 use std::sync::LazyLock;
 
-// Metrics defined in this module register into the Prometheus default registry.
-// The metrics API exposes them via `gather_default_metrics()`.
+// Registered into the Prometheus default registry; exposed via `gather_default_metrics()`.
 
 pub static METRICS_EIP8142: LazyLock<MetricsEip8142> = LazyLock::new(MetricsEip8142::default);
 
-/// `payload_blob_count` is small (1 .. MAX_BLOBS_PER_BLOCK), so use explicit
-/// integer-aligned buckets rather than exponential.
-fn payload_blob_count_buckets() -> Vec<f64> {
-    vec![
-        1.0, 2.0, 3.0, 4.0, 6.0, 9.0, 12.0, 16.0, 24.0, 32.0, 48.0,
-    ]
-}
-
 #[derive(Debug, Clone)]
 pub struct MetricsEip8142 {
-    /// 1 while EIP-8142 (block-in-blobs) is active, 0 otherwise.
+    /// 1 while EIP-8142 is active, else 0.
     pub active: IntGauge,
-    /// Distribution of `payload_blob_count` per built block.
-    pub payload_blob_count: Histogram,
-    /// Cumulative blob count, split by `kind` ("payload" vs "type3").
-    pub blobs_total: IntCounterVec,
-    /// Payload-blob count of the most recent built block (per-block, not a histogram).
+    /// Payload-blob count of the most recent built block.
     pub payload_blob_count_last: IntGauge,
     /// Total blobs (payload + type-3) in the most recent built block.
     pub block_blobs: IntGauge,
     /// Effective MAX_BLOBS_PER_BLOCK for the most recent built block.
     pub max_blobs: IntGauge,
-    /// Fill fraction (0..1) of the trailing payload blob of the most recent block
-    /// — the padding-waste signal (every blob but the last is full).
+    /// Fill fraction (0..1) of the most recent block's trailing payload blob (padding waste).
     pub last_payload_blob_utilization: Gauge,
-    /// RLP-encoded block access list bytes packed into payload blobs, most recent
-    /// built block.
+    /// RLP BAL bytes packed into payload blobs (most recent built block).
     pub payload_bal_bytes: IntGauge,
-    /// RLP-encoded transactions bytes packed into payload blobs, most recent built
-    /// block.
+    /// RLP transaction bytes packed into payload blobs (most recent built block).
     pub payload_txs_bytes: IntGauge,
-    /// Duration of payload-blob KZG work, by `op`: "commit" (native newPayload,
-    /// `blob_to_kzg_commitment` MSM, hot path) and "proofs" (zk getPayload,
-    /// `compute_payload_kzg_proofs`).
+    /// Payload-blob KZG work duration by op ("commit" native / "proofs" zk).
     pub kzg_duration_seconds: HistogramVec,
-    /// getPayload build duration by `phase`: "fill_transactions" (EVM exec + selection),
-    /// "encode" (BAL+txs → payload blobs), "build_bundle" (KZG commitments + cell proofs).
-    /// `build_bundle` is also under `kzg_duration_seconds`; kept here so all three phases
-    /// share one histogram.
+    /// getPayload build duration by phase (fill_transactions / encode / build_bundle).
     pub build_phase_seconds: HistogramVec,
-    /// Cheap incremental upper-bound estimate of the BAL byte size of the most recent
-    /// built block (`estimated_encoded_len`, what tx selection gates on).
+    /// Incremental upper-bound estimate of BAL bytes (most recent build).
     pub bal_estimated_size_bytes: IntGauge,
-    /// Exact BAL byte size of the most recent built block. Together with
-    /// `bal_estimated_size_bytes` this exposes the estimate↔real gap (the gate's slack).
+    /// Exact BAL bytes (most recent build); gap vs the estimate is the gate's slack.
     pub bal_actual_size_bytes: IntGauge,
 }
 
@@ -71,18 +48,6 @@ impl MetricsEip8142 {
                 "1 while EIP-8142 (block-in-blobs) is active, 0 otherwise"
             )
             .expect("Failed to create eip8142_active metric"),
-            payload_blob_count: register_histogram!(
-                "eip8142_payload_blob_count",
-                "Distribution of payload_blob_count per built block",
-                payload_blob_count_buckets()
-            )
-            .expect("Failed to create eip8142_payload_blob_count metric"),
-            blobs_total: register_int_counter_vec!(
-                "eip8142_blobs_total",
-                "Cumulative blob count split by kind (payload vs type3)",
-                &["kind"]
-            )
-            .expect("Failed to create eip8142_blobs_total metric"),
             payload_blob_count_last: register_int_gauge!(
                 "eip8142_payload_blob_count_last",
                 "Payload-blob count of the most recent built block"

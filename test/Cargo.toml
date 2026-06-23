@@ -76,5 +76,15 @@ libssz-types.workspace = true
 name = "ethrex_tests"
 path = "tests/tests.rs"
 
+[[test]]
+name = "eip8142_native"
+path = "tests/eip8142_native.rs"
+required-features = ["c-kzg"]
+
+[[test]]
+name = "eip8142_guest"
+path = "tests/eip8142_guest.rs"
+required-features = ["c-kzg", "eip-8025"]
+
 [lints]
 workspace = true

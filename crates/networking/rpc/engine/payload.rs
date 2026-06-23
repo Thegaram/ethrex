@@ -932,13 +932,18 @@ fn attach_payload_kzg_proofs(response: &mut ExecutionPayloadResponse) -> Result<
         )
     })?;
 
-    let _proofs_timer = ethrex_metrics::eip8142::METRICS_EIP8142
-        .kzg_duration_seconds
-        .with_label_values(&["proofs"])
-        .start_timer();
-    bundle.payload_kzg_proofs = bundle
-        .compute_payload_kzg_proofs(payload_blob_count)
-        .map_err(|err| RpcErr::Internal(format!("failed to compute payload_kzg_proofs: {err}")))?;
+    {
+        let _timer = ethrex_metrics::eip8142::METRICS_EIP8142
+            .kzg_duration_seconds
+            .with_label_values(&["proofs"])
+            .start_timer();
+
+        bundle.payload_kzg_proofs = bundle
+            .compute_payload_kzg_proofs(payload_blob_count)
+            .map_err(|err| {
+                RpcErr::Internal(format!("failed to compute payload_kzg_proofs: {err}"))
+            })?;
+    }
 
     Ok(())
 }
@@ -1454,6 +1459,16 @@ async fn handle_new_payload_v6(
     {
         return Ok(PayloadStatus::invalid_with_err(&err));
     }
+
+    // Note on BAL canonicality: `verify_eip8142_payload` below encodes the payload blobs
+    // from the *raw* BAL bytes (whose keccak is the header `block_access_list_hash`). A
+    // non-canonical-but-decodable BAL is still rejected here — equivalently to the guest's
+    // explicit re-encode check in `new_payload_request_bib_to_block` — because the EIP-7928
+    // commitment check during execution recomputes the hash from the *canonical* re-encoding
+    // (`validate_block_access_list_hash` / `BlockAccessList::matches_commitment`) and compares
+    // it against `block_access_list_hash`; keccak being injective, raw != canonical ⇒ mismatch
+    // ⇒ INVALID. So both Engine-API variants reach the same verdict (spec: "both variants
+    // enforce identical validity conditions").
 
     // EIP-8142 "block-in-blobs": Verify the payload blob count and the combined versioned hashes.
     // This replaces V3's type-3-only check.

@@ -27,7 +27,9 @@ use ethrex_common::{
 use ethrex_common::types::eip8142::{HEADER_SIZE, payload_blob_count_for_byte_len};
 
 #[cfg(feature = "c-kzg")]
-use ethrex_common::types::{PayloadBlobsBundle, eip8142::execution_payload_data_to_blobs};
+use ethrex_common::types::{
+    PayloadBlobsBundle, eip8142::execution_payload_data_to_blobs_with_lens,
+};
 
 use ethrex_crypto::NativeCrypto;
 use ethrex_crypto::keccak::Keccak256;
@@ -56,10 +58,17 @@ use crate::{
 use thiserror::Error;
 use tracing::{debug, warn};
 
-/// EIP-8142 "block-in-blobs": headroom for BAL growth *after* tx selection — withdrawal credits + request
-/// system-calls (EIP-7002/7251/6110). Bounded (few withdrawals + fixed system contracts), so
-/// a small fixed reservation is sound; `add_eip8142_payload_blobs` is the hard guarantee.
-const EIP8142_POST_SELECTION_BAL_HEADROOM_BYTES: usize = 8 * 1024;
+// EIP-8142 "block-in-blobs": Keeping the combined blob count within MAX_BLOBS_PER_BLOCK.
+//
+// The payload blobs (BAL + transactions, encoded into blobs) and type-3 user blobs must
+// fit within the blob count limit. The payload-blob count isn't known until the BAL is
+// final. During tx selection we estimate it with a cheap running upper bound on the BAL
+// size (`estimated_encoded_len`) plus the tx bytes, and skip candidates that would overflow.
+// We then do a strict check at seal time (`add_eip8142_payload_blobs`).
+
+/// Headroom for BAL growth after tx selection (withdrawal credits + request system-calls);
+/// bounded, so a small fixed reservation keeps the projection sound.
+const EIP8142_POST_TRANSACTIONS_BUFFER_BYTES: usize = 8 * 1024;
 
 #[derive(Debug)]
 pub struct PayloadBuildTask {
@@ -248,8 +257,7 @@ pub struct PayloadBuildContext {
     pub payload_size: u64,
     /// Block Access List for EIP-7928
     pub block_access_list: Option<BlockAccessList>,
-    /// Whether EIP-8142 "block-in-blobs" is active for this block. When set, the
-    /// post-execution combined blob-limit check runs in `apply_plain_transaction`.
+    /// Whether EIP-8142 "block-in-blobs" is active for this block.
     pub eip8142_active: bool,
 }
 
@@ -335,10 +343,8 @@ impl PayloadBuildContext {
         self.payload.header.base_fee_per_gas
     }
 
-    /// Protocol `MAX_BLOBS_PER_BLOCK` for this block (the limit `verify_blob_gas_usage`
-    /// enforces). Unlike `Blockchain::effective_max_blobs`, this ignores the builder's
-    /// optional user blob cap — used for the EIP-8142 combined (payload + type-3) limit,
-    /// since payload blobs are mandatory.
+    /// Protocol `MAX_BLOBS_PER_BLOCK` for this block, used for the EIP-8142 combined (payload + type-3) limit.
+    /// Unlike `effective_max_blobs`, this ignores the builder's optional blob cap, since payload blobs are mandatory.
     fn protocol_max_blobs(&self) -> usize {
         self.chain_config()
             .get_fork_blob_schedule(self.payload.header.timestamp)
@@ -505,10 +511,11 @@ impl Blockchain {
         // build phase 1/3: EVM execution + tx selection (see `build_phase_seconds`).
         {
             #[cfg(feature = "metrics")]
-            let _phase = ethrex_metrics::eip8142::METRICS_EIP8142
+            let _timer = ethrex_metrics::eip8142::METRICS_EIP8142
                 .build_phase_seconds
                 .with_label_values(&["fill_transactions"])
                 .start_timer();
+
             self.fill_transactions(&mut context)?;
         }
         // EIP-7928: Post-tx phase uses index n+1 for both requests and withdrawals.
@@ -691,8 +698,8 @@ impl Blockchain {
             {
                 break;
             }
-            // Provisionally include the candidate's bytes so the EIP-8142 gate accounts for
-            // this tx; rolled back below on every path that doesn't add it.
+            // Include the candidate's bytes now (the EIP-8142 gate reads payload_size);
+            // rolled back below on every path that doesn't keep the tx.
             context.payload_size = potential_rlp_block_size;
 
             // TODO: maybe fetch hash too when filtering mempool so we don't have to compute it here (we can do this in the same refactor as adding timestamp)
@@ -709,11 +716,10 @@ impl Blockchain {
                 continue;
             }
 
-            // EIP-8142 "block-in-blobs" pre-execution fast-reject: skip candidates that already overflow the
-            // combined blob cap on committed state alone, sparing the EVM run + O(BAL)
-            // checkpoint near the cap. A lower bound (the candidate's own BAL growth isn't
-            // measured yet), so it only drops certain overflows; the post-exec gate in
-            // `apply_tx_to_payload` catches the marginal case exactly.
+            // EIP-8142 pre-execution fast-reject: skip candidates that already overflow the
+            // combined blob cap on committed state alone, sparing the EVM run + O(BAL) checkpoint.
+            // It's a lower bound (the candidate's BAL growth isn't measured yet), so the exact
+            // post-exec gate in `apply_tx_to_payload` still catches the marginal case.
             if eip8142_projected_blob_overflow(&head_tx, context).is_some() {
                 debug!("Skipping transaction: {tx_hash}, EIP-8142 combined blob cap reached");
                 context.payload_size = context.payload_size.saturating_sub(candidate_rlp_size);
@@ -872,137 +878,95 @@ impl Blockchain {
         Ok(())
     }
 
-    // Add payload blobs as defined in EIP-8142 "block-in-blobs"
+    // EIP-8142 "block-in-blobs": producing payload blobs needs a KZG backend.
+    #[cfg(not(feature = "c-kzg"))]
+    fn add_eip8142_payload_blobs(
+        &self,
+        _context: &mut PayloadBuildContext,
+    ) -> Result<(), ChainError> {
+        Err(ChainError::Custom(
+            "EIP-8142 is active but ethrex was built without the c-kzg feature, so payload \
+             blobs cannot be produced (rebuild with c-kzg or unset eip8142_time)"
+                .to_string(),
+        ))
+    }
+
+    // EIP-8142 "block-in-blobs": construct and prepend the payload blobs.
+    #[cfg(feature = "c-kzg")]
     fn add_eip8142_payload_blobs(
         &self,
         context: &mut PayloadBuildContext,
     ) -> Result<(), ChainError> {
-        // EIP-8142 must come after Amsterdam, so BAL must be present
-        if context.block_access_list.is_none() {
-            return Err(ChainError::Custom(
+        // EIP-8142 ⇒ Amsterdam, so the BAL must be present.
+        let block_access_list = context.block_access_list.as_ref().ok_or_else(|| {
+            ChainError::Custom(
                 "EIP-8142 is active but the block access list is missing \
                  (configure eip8142_time >= amsterdam_time)"
                     .to_string(),
-            ));
+            )
+        })?;
+
+        // Encode the BAL + txs into payload blobs.
+        let (payload_blobs, bal_len, txs_len) = {
+            #[cfg(feature = "metrics")]
+            let _timer = ethrex_metrics::eip8142::METRICS_EIP8142
+                .build_phase_seconds
+                .with_label_values(&["encode"])
+                .start_timer();
+
+            execution_payload_data_to_blobs_with_lens(
+                block_access_list,
+                &context.payload.body.transactions,
+            )
+        };
+
+        // Suppress unused variable errors.
+        #[cfg(not(feature = "metrics"))]
+        let _ = (bal_len, txs_len);
+
+        let payload_bundle = {
+            // Measure latency added by KZG commitments + cell proofs.
+            #[cfg(feature = "metrics")]
+            let _timer = ethrex_metrics::eip8142::METRICS_EIP8142
+                .build_phase_seconds
+                .with_label_values(&["build_bundle"])
+                .start_timer();
+
+            // Encode payload blobs.
+            // Hardcode wrapper version 1 (EIP-7594 cell proofs).
+            PayloadBlobsBundle::create_from_blobs(&payload_blobs, Some(1))?
+        };
+
+        // Prepend payload blobs to existing blob bundle.
+        context.blobs_bundle =
+            BlobsBundle::from_sections(payload_bundle, std::mem::take(&mut context.blobs_bundle))?;
+
+        // Set the new EIP-8142 header field
+        context.payload.header.payload_blob_count = Some(payload_blobs.len() as u64);
+
+        // Hard guarantee against the protocol MAX_BLOBS_PER_BLOCK.
+        // Fail here rather than build an invalid block.
+        let max_blobs = context.protocol_max_blobs();
+        let total_blobs = context.blobs_bundle.blobs.len();
+        if total_blobs > max_blobs {
+            return Err(ChainError::Custom(format!(
+                "EIP-8142: built block has {total_blobs} blobs ({} payload + {} type-3), \
+                 exceeding MAX_BLOBS_PER_BLOCK ({max_blobs})",
+                payload_blobs.len(),
+                total_blobs.saturating_sub(payload_blobs.len()),
+            )));
         }
 
-        // Creating the payload blobs (and commitments/proofs) requires a KZG backend
-        #[cfg(not(feature = "c-kzg"))]
-        {
-            Err(ChainError::Custom(
-                "EIP-8142 is active but ethrex was built without the c-kzg feature, \
-                 so payload blobs cannot be produced (rebuild with c-kzg or unset \
-                 eip8142_time)"
-                    .to_string(),
-            ))
-        }
+        metrics!({
+            record_eip8142_build_metrics(bal_len, txs_len, payload_blobs.len());
+        });
 
-        #[cfg(feature = "c-kzg")]
-        {
-            let block_access_list = context
-                .block_access_list
-                .as_ref()
-                .expect("block access list presence checked above");
-
-            // build phase 2/3 ("encode"): RLP-encode the BAL + txs into payload blobs.
-            let payload_blobs = {
-                #[cfg(feature = "metrics")]
-                let _phase = ethrex_metrics::eip8142::METRICS_EIP8142
-                    .build_phase_seconds
-                    .with_label_values(&["encode"])
-                    .start_timer();
-                execution_payload_data_to_blobs(block_access_list, &context.payload.body.transactions)
-            };
-
-            // build phase 3/3 ("build_bundle"): KZG commitments + cell proofs — the EIP-8142
-            // latency jump. Timed under both `kzg_duration_seconds` and `build_phase_seconds`.
-            let payload_bundle = {
-                #[cfg(feature = "metrics")]
-                let _timer = ethrex_metrics::eip8142::METRICS_EIP8142
-                    .kzg_duration_seconds
-                    .with_label_values(&["build_bundle"])
-                    .start_timer();
-                #[cfg(feature = "metrics")]
-                let _phase = ethrex_metrics::eip8142::METRICS_EIP8142
-                    .build_phase_seconds
-                    .with_label_values(&["build_bundle"])
-                    .start_timer();
-                // Note: we hardcode version 1 (EIP-7594 cell proofs) for now
-                PayloadBlobsBundle::create_from_blobs(&payload_blobs, Some(1))?
-            };
-            context.blobs_bundle = BlobsBundle::from_sections(
-                payload_bundle,
-                std::mem::take(&mut context.blobs_bundle),
-            )?;
-
-            // Set the new EIP-8142 header field
-            context.payload.header.payload_blob_count = Some(payload_blobs.len() as u64);
-
-            // Hard guarantee of the combined (payload + type-3) limit against the protocol
-            // MAX_BLOBS_PER_BLOCK. Selection seals before crossing it, so reaching here means
-            // the post-selection BAL tail overran its headroom — fail rather than build an
-            // invalid block.
-            let max_blobs = context.protocol_max_blobs();
-            let total_blobs = context.blobs_bundle.blobs.len();
-            if total_blobs > max_blobs {
-                return Err(ChainError::Custom(format!(
-                    "EIP-8142: built block has {total_blobs} blobs ({} payload + {} type-3), \
-                     exceeding MAX_BLOBS_PER_BLOCK ({max_blobs}). Failing the build.",
-                    payload_blobs.len(),
-                    total_blobs.saturating_sub(payload_blobs.len()),
-                )));
-            }
-
-            metrics!({
-                use ethrex_common::types::eip8142::{
-                    execution_payload_data_section_lens, last_blob_utilization,
-                };
-                use ethrex_metrics::eip8142::METRICS_EIP8142;
-
-                let payload_count = payload_blobs.len();
-                let total_blobs = context.blobs_bundle.blobs.len();
-                let (bal_len, txs_len) = execution_payload_data_section_lens(
-                    block_access_list,
-                    &context.payload.body.transactions,
-                );
-                let data_len = HEADER_SIZE + bal_len + txs_len;
-
-                METRICS_EIP8142.payload_bal_bytes.set(bal_len as i64);
-                METRICS_EIP8142.payload_txs_bytes.set(txs_len as i64);
-                // Exact BAL size for this build, paired with the cheap estimate
-                // recorded in `finalize_payload` (the per-node estimate↔exact gap).
-                METRICS_EIP8142.bal_actual_size_bytes.set(bal_len as i64);
-                METRICS_EIP8142.active.set(1);
-                METRICS_EIP8142
-                    .payload_blob_count
-                    .observe(payload_count as f64);
-                METRICS_EIP8142
-                    .payload_blob_count_last
-                    .set(payload_count as i64);
-                METRICS_EIP8142
-                    .blobs_total
-                    .with_label_values(&["payload"])
-                    .inc_by(payload_count as u64);
-                METRICS_EIP8142
-                    .blobs_total
-                    .with_label_values(&["type3"])
-                    .inc_by(total_blobs.saturating_sub(payload_count) as u64);
-                METRICS_EIP8142.block_blobs.set(total_blobs as i64);
-                METRICS_EIP8142.max_blobs.set(max_blobs as i64);
-                METRICS_EIP8142
-                    .last_payload_blob_utilization
-                    .set(last_blob_utilization(data_len, payload_count));
-            });
-
-            Ok(())
-        }
+        Ok(())
     }
 
     pub fn finalize_payload(&self, context: &mut PayloadBuildContext) -> Result<(), ChainError> {
-        // EIP-8142 "block-in-blobs": record the builder's cheap incremental BAL-size estimate while the
-        // recorder still exists (`take_bal` consumes it next). Paired with the exact
-        // `bal_actual_size_bytes` in `add_eip8142_payload_blobs`, this gives the
-        // per-node estimate↔exact gap for every built block (build-side metric).
+        // EIP-8142: record the BAL-size estimate before `take_bal` consumes the recorder;
+        // paired with the exact `bal_actual_size_bytes` it gives the gate's estimate↔exact gap.
         metrics!({
             use ethrex_metrics::eip8142::METRICS_EIP8142;
             if context.eip8142_active
@@ -1053,16 +1017,10 @@ impl Blockchain {
         context.block_access_list = block_access_list;
 
         // Add payload blobs (EIP-8142)
-        if context
-            .chain_config()
-            .is_eip8142_activated(context.payload.header.timestamp)
-        {
+        if context.eip8142_active {
             self.add_eip8142_payload_blobs(context)?;
         }
 
-        // Blob-count metrics for EVERY block (all forks): total blobs, MAX_BLOBS, and
-        // payload-blob count (0 pre-8142). Lets the dashboard show max/user blobs before
-        // activation. Payload-specific metrics live in add_eip8142_payload_blobs.
         metrics!({
             use ethrex_metrics::eip8142::METRICS_EIP8142;
             METRICS_EIP8142
@@ -1088,25 +1046,36 @@ impl Blockchain {
     }
 }
 
-/// Projected blob counts that would exceed the limit, reported by
-/// [`eip8142_projected_blob_overflow`] for the rejection message.
+#[cfg(feature = "metrics")]
+#[cfg_attr(not(feature = "c-kzg"), allow(dead_code))]
+fn record_eip8142_build_metrics(bal_len: usize, txs_len: usize, payload_blob_count: usize) {
+    use ethrex_common::types::eip8142::last_blob_utilization;
+    use ethrex_metrics::eip8142::METRICS_EIP8142;
+    METRICS_EIP8142.active.set(1);
+    METRICS_EIP8142.payload_bal_bytes.set(bal_len as i64);
+    METRICS_EIP8142.payload_txs_bytes.set(txs_len as i64);
+    METRICS_EIP8142.bal_actual_size_bytes.set(bal_len as i64);
+    METRICS_EIP8142
+        .last_payload_blob_utilization
+        .set(last_blob_utilization(
+            HEADER_SIZE + bal_len + txs_len,
+            payload_blob_count,
+        ));
+}
+
+/// Projected blob counts that would exceed the limit, for the rejection message.
 struct BlobLimitOverflow {
     payload_blobs: usize,
     type3_blobs: usize,
     max_blobs: usize,
 }
 
-/// EIP-8142 "block-in-blobs": does keeping `head` push the block's combined blob count — payload blobs
-/// (encoding the BAL + txs) plus type-3 user blobs — over the protocol `MAX_BLOBS_PER_BLOCK`
-/// (what `verify_blob_gas_usage` enforces, ignoring the builder's user-blob cap since payload
-/// blobs are mandatory)? Returns the projected counts on overflow.
+/// Would keeping `head` push the block's combined blob count (payload + type-3) over the protocol
+/// `MAX_BLOBS_PER_BLOCK`? Returns the projected counts on overflow, else `None`.
 ///
-/// The BAL footprint is the recorder's cheap O(1) running upper bound (`estimated_encoded_len`),
-/// so there's no whole-BAL re-measurement on the hot path. Called *after* a tx executes it's the
-/// exact post-add gate (recorder includes the tx); called *before* (the `fill_transactions`
-/// fast-reject) it's a lower bound (the candidate's own BAL growth isn't measured yet). Being a
-/// sound upper bound, a fit guarantees the `add_eip8142_payload_blobs` finalize check can't trip,
-/// at the cost of a slightly conservative seal.
+/// Uses the recorder's O(1) running upper bound for the BAL size. Called *after* a tx executes
+/// it's exact; called *before* (the fast-reject) it's a lower bound. Either way a fit guarantees
+/// the `add_eip8142_payload_blobs` seal check can't trip, at the cost of a slightly early seal.
 fn eip8142_projected_blob_overflow(
     head: &HeadTransaction,
     context: &PayloadBuildContext,
@@ -1114,21 +1083,19 @@ fn eip8142_projected_blob_overflow(
     if !context.eip8142_active {
         return None;
     }
-    // 8142 ⇒ Amsterdam ⇒ BAL recording is on, so the recorder is always present here;
-    // if it somehow isn't, we can't estimate, so we skip the gate and let the exact
-    // missing-BAL check in `add_eip8142_payload_blobs` fail the build.
+
+    // 8142 ⇒ Amsterdam ⇒ BAL recording is on, so the recorder is present; if not, skip the gate
+    // and let the missing-BAL check in `add_eip8142_payload_blobs` fail the build.
     let recorder = context.vm.db.bal_recorder.as_ref()?;
 
-    let max_blobs = context.protocol_max_blobs();
-    // Type-3 blobs already accumulated plus this tx's own blobs (0 for plain txs;
-    // for a blob tx the bundle is folded into the context only after this returns Ok).
-    let type3_blobs = context.blobs_bundle.blobs.len() + head.blob_versioned_hashes_len();
     let payload_blobs = payload_blob_count_for_byte_len(
         HEADER_SIZE
             + recorder.estimated_encoded_len()
-            + EIP8142_POST_SELECTION_BAL_HEADROOM_BYTES
+            + EIP8142_POST_TRANSACTIONS_BUFFER_BYTES
             + context.payload_size as usize,
     );
+    let type3_blobs = context.blobs_bundle.blobs.len() + head.blob_versioned_hashes_len();
+    let max_blobs = context.protocol_max_blobs();
 
     (payload_blobs + type3_blobs > max_blobs).then_some(BlobLimitOverflow {
         payload_blobs,
@@ -1159,8 +1126,9 @@ pub fn apply_plain_transaction(
         .saturating_add(tx_regular_gas);
     let new_state = context.block_state_gas_used.saturating_add(tx_state_gas);
 
-    // Post-execution checks sharing one rollback (both need the executed tx): EIP-8037
-    // state-gas overflow and the EIP-8142 combined blob-limit.
+    // EIP-8037 (Amsterdam+): post-execution block gas overflow check
+    // Reject the transaction if adding it would cause max(regular, state) to exceed the gas limit
+    // and also check the EIP-8142 "block-in-blobs" combined blob-limit
     let gas_overflow =
         context.is_amsterdam && new_regular.max(new_state) > context.payload.header.gas_limit;
     let blob_overflow = eip8142_projected_blob_overflow(head, context);
@@ -1168,9 +1136,8 @@ pub fn apply_plain_transaction(
         // Rollback transaction state before returning error:
         // 1. Undo DB mutations (nonce, balance, storage, etc.)
         // 2. Revert cumulative gas counter inflation
-        // This ensures the next transaction executes against clean state. The BAL
-        // recorder is restored separately by the caller (`apply_tx_to_payload`),
-        // which holds a per-tx checkpoint and rolls it back on the returned error.
+        // This ensures the next transaction executes against clean state.
+        // The BAL recorder is rolled back separately by the caller.
         context.vm.undo_last_tx()?;
         // `cumulative_gas_spent` was bumped inside `execute_tx` above; revert it
         // now that the tx is being rejected. Use `saturating_sub` as a defensive
@@ -1185,26 +1152,27 @@ pub fn apply_plain_transaction(
             .cumulative_gas_spent
             .saturating_sub(report.gas_spent);
 
-        let reason = if let Some(BlobLimitOverflow {
+        if let Some(BlobLimitOverflow {
             payload_blobs,
             type3_blobs,
             max_blobs,
         }) = blob_overflow
         {
-            format!(
+            return Err(EvmError::Custom(format!(
                 "EIP-8142: including transaction would exceed the combined blob limit: \
                  {payload_blobs} payload + {type3_blobs} type-3 = {} > MAX_BLOBS_PER_BLOCK {max_blobs}",
                 payload_blobs + type3_blobs,
-            )
-        } else {
-            format!(
-                "block gas limit exceeded (state gas overflow): \
-                 max({new_regular}, {new_state}) = {} > gas_limit {}",
-                new_regular.max(new_state),
-                context.payload.header.gas_limit
-            )
+            ))
+        .into());
         };
-        return Err(EvmError::Custom(reason).into());
+
+        return Err(EvmError::Custom(format!(
+            "block gas limit exceeded (state gas overflow): \
+             max({new_regular}, {new_state}) = {} > gas_limit {}",
+            new_regular.max(new_state),
+            context.payload.header.gas_limit
+        ))
+        .into());
     }
 
     // Commit the new totals

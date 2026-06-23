@@ -70,9 +70,24 @@ pub fn execution_payload_data_to_blobs(
     block_access_list: &BlockAccessList,
     transactions: &Vec<Transaction>,
 ) -> Vec<Blob> {
-    payload_parts_to_blobs(
-        &block_access_list.encode_to_vec(),
-        &transactions.encode_to_vec(),
+    execution_payload_data_to_blobs_with_lens(block_access_list, transactions).0
+}
+
+/// Like [`execution_payload_data_to_blobs`], but also returns the RLP-encoded byte
+/// lengths of the two packed sections, `(blobs, bal_len, txs_len)`. The builder
+/// uses the lengths for size metrics without re-encoding the (potentially multi-MiB)
+/// block access list and transactions a second time.
+pub fn execution_payload_data_to_blobs_with_lens(
+    block_access_list: &BlockAccessList,
+    transactions: &Vec<Transaction>,
+) -> (Vec<Blob>, usize, usize) {
+    let bal_bytes = block_access_list.encode_to_vec();
+    let txs_bytes = transactions.encode_to_vec();
+    let (bal_len, txs_len) = (bal_bytes.len(), txs_bytes.len());
+    (
+        payload_parts_to_blobs(&bal_bytes, &txs_bytes),
+        bal_len,
+        txs_len,
     )
 }
 
@@ -86,18 +101,6 @@ pub fn execution_payload_to_blobs_from_raw_bal(
     payload_parts_to_blobs(bal_bytes, &transactions.encode_to_vec())
 }
 
-/// Byte length of the packed payload data — the 8-byte length header plus the
-/// RLP-encoded block access list and transactions — i.e. the unpadded bytes that
-/// [`execution_payload_data_to_blobs`] packs into blobs. Recomputes the section
-/// encodings, so this is for off-hot-path use (metrics), not block building.
-pub fn execution_payload_data_byte_len(
-    block_access_list: &BlockAccessList,
-    transactions: &Vec<Transaction>,
-) -> usize {
-    let (bal_len, txs_len) = execution_payload_data_section_lens(block_access_list, transactions);
-    HEADER_SIZE + bal_len + txs_len
-}
-
 /// Number of payload blobs the EIP-8142 codec emits for a packed payload-data
 /// section of `data_len` bytes (the 8-byte length header + RLP block access list
 /// + RLP transactions): `ceil(data_len / USABLE_BYTES_PER_BLOB)`.
@@ -107,20 +110,6 @@ pub fn execution_payload_data_byte_len(
 /// `payload_blob_count + type-3 blobs` count within `MAX_BLOBS_PER_BLOCK`.
 pub fn payload_blob_count_for_byte_len(data_len: usize) -> usize {
     data_len.div_ceil(USABLE_BYTES_PER_BLOB)
-}
-
-/// RLP-encoded byte lengths of the two packed payload-data sections, `(bal_len,
-/// txs_len)` — the same bytes [`execution_payload_data_to_blobs`] packs after the
-/// 8-byte header. For observability (size breakdown), so it recomputes the section
-/// encodings and is not for the block-building hot path.
-pub fn execution_payload_data_section_lens(
-    block_access_list: &BlockAccessList,
-    transactions: &Vec<Transaction>,
-) -> (usize, usize) {
-    (
-        block_access_list.encode_to_vec().len(),
-        transactions.encode_to_vec().len(),
-    )
 }
 
 /// Fill fraction (in `(0.0, 1.0]`) of the *trailing* payload blob. Every payload

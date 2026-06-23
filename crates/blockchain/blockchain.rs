@@ -562,17 +562,12 @@ impl Blockchain {
         // `--no-bal-parallel-trie` opts out: leave `optimistic_updates = None` so
         // the merkleizer takes the streaming branch (fed by the EVM-side
         // `bal_to_account_updates` send over the channel below).
-        // The synthesized path requires the parallel executor; it is unavailable when:
-        // - eip-8025 / non-rayon builds compile the parallel BAL executor out and always
-        //   take the sequential path (the channel below is never created), or
-        // - witness collection forces the sequential executor, which streams per-tx
-        //   updates over the channel that only the streaming merkleizer consumes.
-        // In either case optimistic merkleization must stay off or the receiver is dropped.
+        // Witness collection forces the streaming branch too: the sequential
+        // executor (see `bal_parallel_exec_enabled` below) streams per-tx
+        // updates over the channel, which only the streaming merkleizer
+        // consumes — the synthesized path would leave the receiver dropped.
         let optimistic_updates: Option<FxHashMap<Address, BalSynthesisItem>> =
-            if cfg!(all(feature = "rayon", not(feature = "eip-8025")))
-                && self.options.bal_parallel_trie_enabled
-                && !collect_witness
-            {
+            if self.options.bal_parallel_trie_enabled && !collect_witness {
                 bal.map(synthesize_bal_updates)
             } else {
                 None
@@ -2199,11 +2194,7 @@ impl Blockchain {
             warn!("Failed to store block access list for block {block_hash}: {err}");
         }
 
-        // EIP-8142: record the block's blob/payload shape on *import*, so these
-        // network-wide metrics are reported by every node for every canonical block
-        // (the builder-side recording in `add_eip8142_payload_blobs` only covers the
-        // proposer). The BAL bytes come from this node's own `produced_bal` (or the
-        // validated incoming `bal`). Block-building-specific metrics stay builder-side.
+        // EIP-8142 "block-in-blobs": record the block's blob/payload shape on *import*.
         metrics!({
             use ethrex_common::types::eip8142::{HEADER_SIZE, last_blob_utilization};
             use ethrex_metrics::eip8142::METRICS_EIP8142;
@@ -2212,7 +2203,7 @@ impl Blockchain {
                 && let Some(payload_blob_count) = block.header.payload_blob_count
             {
                 let payload_blob_count = payload_blob_count as usize;
-                let type3_blobs: usize = block
+                let type3_blob_count: usize = block
                     .body
                     .transactions
                     .iter()
@@ -2227,14 +2218,14 @@ impl Blockchain {
                     .or(bal)
                     .map(|b| b.length())
                     .unwrap_or(0);
-                let txs_len = block.body.transactions.encode_to_vec().len();
+                let txs_len = block.body.transactions.length();
                 METRICS_EIP8142.active.set(1);
                 METRICS_EIP8142
                     .payload_blob_count_last
                     .set(payload_blob_count as i64);
                 METRICS_EIP8142
                     .block_blobs
-                    .set((payload_blob_count + type3_blobs) as i64);
+                    .set((payload_blob_count + type3_blob_count) as i64);
                 METRICS_EIP8142.max_blobs.set(max_blobs as i64);
                 METRICS_EIP8142.payload_bal_bytes.set(bal_len as i64);
                 METRICS_EIP8142.payload_txs_bytes.set(txs_len as i64);
@@ -2434,16 +2425,9 @@ impl Blockchain {
         // Helper for percentage
         let pct = |ms: f64| (ms / total_ms * 100.0).round() as u64;
 
-        // EIP-8142 "block-in-blobs": append the payload-blob count so it shows in the log stream.
-        // Omitted pre-fork (field is None), so non-EIP-8142 lines are unchanged.
-        let payload_blobs_suffix = match payload_blob_count {
-            Some(count) => format!(" | {count} payload blobs"),
-            None => String::new(),
-        };
-
         // Format output
         let header = format!(
-            "[METRIC] BLOCK {} {:#x} | {:.3} Ggas/s | {:.2} ms | {} txs | {:.0} Mgas ({}%){}",
+            "[METRIC] BLOCK {} {:#x} | {:.3} Ggas/s | {:.2} ms | {} txs | {:.0} Mgas ({}%) | {} payload blobs",
             block_number,
             block_hash,
             throughput,
@@ -2451,7 +2435,7 @@ impl Blockchain {
             transactions_count,
             as_mgas,
             (gas_used as f64 / gas_limit as f64 * 100.0).round() as u64,
-            payload_blobs_suffix,
+            payload_blob_count.unwrap_or(0),
         );
 
         let bottleneck_marker = |name: &str| {

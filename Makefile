@@ -1,7 +1,8 @@
 .PHONY: build lint test clean run-image build-image clean-vectors \
 		setup-hive test-pattern-default run-hive run-hive-debug clean-hive-logs \
 		load-test-fibonacci load-test-io run-hive-eels-blobs run-hive-eels-amsterdam \
-		run-hive-eels-bal-quick bench-rlp
+		run-hive-eels-bal-quick bench-rlp \
+		test-eip8142 test-eip8142-native test-eip8142-guest
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -37,6 +38,20 @@ CRATE ?= *
 # as its tests depend on external setup that is not handled by this Makefile.
 test: ## 🧪 Run each crate's tests
 	cargo test $(PROFILING_CFG) -p '$(CRATE)' --workspace --exclude ethrex-l2
+
+# EIP-8142 "block-in-blobs" native flow (engine API) tests.
+test-eip8142-native:
+	cargo test -p ethrex-test --test eip8142_native --features c-kzg
+
+# EIP-8142 "block-in-blobs" zk flow (guest program) tests.
+test-eip8142-guest:
+	cargo test -p ethrex-test --test eip8142_guest --features c-kzg,eip-8025
+
+# The native and guest flows MUST be run as SEPARATE invocations
+# with disjoint features. Combining `c-kzg,eip-8025` across both
+# targets would attempt to compile the native target's `ethrex-blockchain`
+# without its parallel BAL executor, leading to a runtime error.
+test-eip8142: test-eip8142-native test-eip8142-guest
 
 clean: clean-vectors ## 🧹 Remove build artifacts
 	cargo clean

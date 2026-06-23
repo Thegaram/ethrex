@@ -95,11 +95,9 @@ impl BlobsBundle {
         self.blobs.is_empty() && self.commitments.is_empty() && self.proofs.is_empty()
     }
 
-    // In the future we might want to provide a new method that calculates the commitments and proofs using the following.
-    #[cfg(feature = "c-kzg")]
-    /// Build path: per-blob cell-proof MSMs are independent and dominate getPayload
-    /// latency under EIP-8142, so compute them across rayon threads.
-    #[cfg(all(feature = "rayon", not(feature = "eip-8025")))]
+    /// Builder path: blob cell-proofs are independent and dominate engine_getPayload latency
+    /// under EIP-8142 where the EL node must compute proofs for payload blobs, so parallelize.
+    #[cfg(all(feature = "c-kzg", feature = "rayon", not(feature = "eip-8025")))]
     pub fn create_from_blobs(
         blobs: &Vec<Blob>,
         wrapper_version: Option<u8>,
@@ -110,11 +108,11 @@ impl BlobsBundle {
             .par_iter()
             .map(|blob| Self::blob_commitment_and_proofs(blob, version))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::bundle_from_per_blob(blobs, version, per_blob))
+        Ok(Self::blobs_to_bundle(blobs, version, per_blob))
     }
 
     /// Guest/zkVM (`eip-8025`) or no `rayon`: deterministic serial form.
-    #[cfg(any(feature = "eip-8025", not(feature = "rayon")))]
+    #[cfg(all(feature = "c-kzg", any(feature = "eip-8025", not(feature = "rayon"))))]
     pub fn create_from_blobs(
         blobs: &Vec<Blob>,
         wrapper_version: Option<u8>,
@@ -124,11 +122,10 @@ impl BlobsBundle {
             .iter()
             .map(|blob| Self::blob_commitment_and_proofs(blob, version))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::bundle_from_per_blob(blobs, version, per_blob))
+        Ok(Self::blobs_to_bundle(blobs, version, per_blob))
     }
 
-    /// One blob's commitment and proof(s): a single proof for wrapper version 0,
-    /// EIP-7594 cell proofs otherwise.
+    #[cfg(feature = "c-kzg")]
     fn blob_commitment_and_proofs(
         blob: &Blob,
         version: u8,
@@ -147,7 +144,8 @@ impl BlobsBundle {
 
     /// Assemble a bundle, flattening per-blob proofs in blob order so commitments
     /// stay 1:1 with blobs and proofs remain aligned for downstream slicing.
-    fn bundle_from_per_blob(
+    #[cfg(feature = "c-kzg")]
+    fn blobs_to_bundle(
         blobs: &[Blob],
         version: u8,
         per_blob: Vec<(Commitment, Vec<Proof>)>,
@@ -174,7 +172,8 @@ impl BlobsBundle {
             .collect()
     }
 
-    /// Computes random-point KZG opening proofs for payload blobs (EIP-8142 "block-in-blobs").
+    /// EIP-8142 "block-in-blobs": compute random-point KZG opening proofs for payload blobs.
+    /// These are included in the zkVM prover witness.
     #[cfg(feature = "c-kzg")]
     pub fn compute_payload_kzg_proofs(
         &self,
@@ -185,6 +184,7 @@ impl BlobsBundle {
         if self.blobs.len() < payload_blob_count || self.commitments.len() < payload_blob_count {
             return Err(BlobsBundleError::BlobsBundleWrongLen);
         }
+
         self.blobs[..payload_blob_count]
             .iter()
             .zip(&self.commitments[..payload_blob_count])
@@ -194,7 +194,7 @@ impl BlobsBundle {
             .collect()
     }
 
-    /// Combines EIP-8142 payload blobs with user (type-3) blobs into a single blob bundle.
+    /// EIP-8142 "block-in-blobs": Combine payload blobs with user (type-3) blobs into a single blob bundle.
     pub fn from_sections(
         payload: PayloadBlobsBundle,
         user: BlobsBundle,
