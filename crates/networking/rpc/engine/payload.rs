@@ -523,8 +523,8 @@ impl NewPayloadV6Request {
 
         // validate the received requests
         validate_execution_requests(&self.execution_requests)?;
-
         let requests_hash = compute_requests_hash(&self.execution_requests);
+
         // The header's BAL hash is the keccak of the raw RLP bytes as-received,
         // preserving the exact encoding for the block hash check.
         let block_access_list_hash = self.raw_bal.as_ref().map(ethrex_common::utils::keccak);
@@ -1288,9 +1288,9 @@ fn validate_execution_payload_v5(payload: &ExecutionPayload) -> Result<(), RpcEr
     Ok(())
 }
 
+// EIP-8142 "block-in-blobs": same as V5 plus the `payload_blob_count` header field
 #[inline]
 fn validate_execution_payload_v6(payload: &ExecutionPayload) -> Result<(), RpcErr> {
-    // EIP-8142 "block-in-blobs": same as V5 plus the `payload_blob_count` header field
     validate_execution_payload_v5(payload)?;
 
     if payload.payload_blob_count.is_none() {
@@ -1441,18 +1441,6 @@ async fn handle_new_payload_v6(
     raw_bal: Option<Bytes>,
     make_witness: bool,
 ) -> Result<PayloadStatus, RpcErr> {
-    // One-shot activation log: `handle_new_payload_v6` is only reached for Bib
-    // (EIP-8142) payloads, so the first call marks the fork going live on this node.
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static EIP8142_ACTIVATION_LOGGED: AtomicBool = AtomicBool::new(false);
-    if !EIP8142_ACTIVATION_LOGGED.swap(true, Ordering::Relaxed) {
-        info!(
-            block = block.header.number,
-            timestamp = block.header.timestamp,
-            "EIP-8142 (block-in-blobs) active: processing first newPayloadV6 block"
-        );
-    }
-
     // V4's block access list ordering check still applies.
     if let Some(bal) = &bal
         && let Err(err) = bal.validate_ordering()
@@ -1460,15 +1448,11 @@ async fn handle_new_payload_v6(
         return Ok(PayloadStatus::invalid_with_err(&err));
     }
 
-    // Note on BAL canonicality: `verify_eip8142_payload` below encodes the payload blobs
-    // from the *raw* BAL bytes (whose keccak is the header `block_access_list_hash`). A
-    // non-canonical-but-decodable BAL is still rejected here — equivalently to the guest's
-    // explicit re-encode check in `new_payload_request_bib_to_block` — because the EIP-7928
-    // commitment check during execution recomputes the hash from the *canonical* re-encoding
-    // (`validate_block_access_list_hash` / `BlockAccessList::matches_commitment`) and compares
-    // it against `block_access_list_hash`; keccak being injective, raw != canonical ⇒ mismatch
-    // ⇒ INVALID. So both Engine-API variants reach the same verdict (spec: "both variants
-    // enforce identical validity conditions").
+    // BAL canonicality: `verify_eip8142_payload` encodes the payload blobs from the *raw*
+    // BAL bytes (keccak == header `block_access_list_hash`). A non-canonical but decodable
+    // BAL is still rejected during execution: the EIP-7928 commitment check rehashes the
+    // *canonical* re-encoding, whose bytes (and thus hash) differ from the raw input, so it
+    // is rejected as INVALID. Consistent with the guest program's explicit re-encode check.
 
     // EIP-8142 "block-in-blobs": Verify the payload blob count and the combined versioned hashes.
     // This replaces V3's type-3-only check.
@@ -1514,17 +1498,15 @@ fn verify_eip8142_payload(
         )));
     }
 
-    // payload-blob versioned hashes first, then type-3 transaction blob hashes.
+    // Recompute payload blob commitments, in parallel.
     let mut actual = {
-        // One commitment MSM per payload blob (op=commit), independent, so parallelize
-        // across rayon threads — serial, this drove newPayload p95 up with blob count.
-        // Host-only crate (never the zkVM guest), so no eip-8025 gating; `collect`
-        // preserves payload-first order for the versioned-hash comparison.
         use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-        let _commit_timer = METRICS_EIP8142
+
+        let _timer = METRICS_EIP8142
             .kzg_duration_seconds
             .with_label_values(&["commit"])
             .start_timer();
+
         payload_blobs
             .par_iter()
             .map(|blob| {
@@ -1534,6 +1516,8 @@ fn verify_eip8142_payload(
             })
             .collect::<Result<Vec<H256>, RpcErr>>()?
     };
+
+    // payload-blob versioned hashes first, then type-3 transaction blob hashes.
     actual.extend(
         block
             .body
