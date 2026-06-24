@@ -185,13 +185,22 @@ impl BlobsBundle {
             return Err(BlobsBundleError::BlobsBundleWrongLen);
         }
 
-        self.blobs[..payload_blob_count]
-            .iter()
-            .zip(&self.commitments[..payload_blob_count])
-            .map(|(blob, commitment)| {
-                compute_blob_kzg_proof(blob, commitment).map_err(BlobsBundleError::from)
-            })
-            .collect()
+        let blobs = &self.blobs[..payload_blob_count];
+        let commitments = &self.commitments[..payload_blob_count];
+
+        let compute = |(blob, commitment): (&Blob, &Commitment)| {
+            compute_blob_kzg_proof(blob, commitment).map_err(BlobsBundleError::from)
+        };
+
+        #[cfg(all(feature = "rayon", not(feature = "eip-8025")))]
+        {
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+            blobs.par_iter().zip(commitments).map(compute).collect()
+        }
+        #[cfg(any(feature = "eip-8025", not(feature = "rayon")))]
+        {
+            blobs.iter().zip(commitments).map(compute).collect()
+        }
     }
 
     /// EIP-8142 "block-in-blobs": Combine payload blobs with user (type-3) blobs into a single blob bundle.
