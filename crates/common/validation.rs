@@ -309,34 +309,39 @@ pub fn validate_block_access_list_size(
 /// Perform validations over the block's blob gas usage.
 /// Must be called only if the block has cancun activated.
 fn verify_blob_gas_usage(block: &Block, config: &ChainConfig) -> Result<(), InvalidBlockError> {
-    let mut blob_gas_used = 0_u32;
+    let mut blob_gas_used = 0_u64;
     let mut blobs_in_block = 0_u32;
     let max_blob_number_per_block = config
         .get_fork_blob_schedule(block.header.timestamp)
         .map(|schedule| schedule.max)
         .ok_or(InvalidBlockError::InvalidBlockFork)?;
-    let max_blob_gas_per_block = max_blob_number_per_block * GAS_PER_BLOB;
+    let max_blob_gas_per_block = u64::from(max_blob_number_per_block) * u64::from(GAS_PER_BLOB);
 
     for transaction in block.body.transactions.iter() {
         if let crate::types::Transaction::EIP4844Transaction(tx) = transaction {
-            blob_gas_used += get_total_blob_gas(tx);
+            blob_gas_used += u64::from(get_total_blob_gas(tx));
             blobs_in_block += tx.blob_versioned_hashes.len() as u32;
         }
     }
-    if blob_gas_used > max_blob_gas_per_block {
-        return Err(InvalidBlockError::ExceededMaxBlobGasPerBlock);
-    }
-    // EIP-8142 "block-in-blobs": Consider both payload blobs and user (type-3) blobs
-    // for the blob count limit.
+
+    // EIP-8142 "block-in-blobs": payload blobs count alongside user (type-3) blobs, both
+    // toward the per-block blob-count limit and toward blob_gas_used (which feeds the next
+    // block's excess_blob_gas / base fee). Check the count first, so an oversized
+    // attacker-controlled payload_blob_count trips the count limit rather than the gas limit.
     let payload_blob_count = block.header.payload_blob_count.unwrap_or(0); // >0 iff activated
     let total_blobs_in_block = payload_blob_count.saturating_add(u64::from(blobs_in_block));
     if total_blobs_in_block > u64::from(max_blob_number_per_block) {
         return Err(InvalidBlockError::ExceededMaxBlobNumberPerBlock);
     }
+    blob_gas_used =
+        blob_gas_used.saturating_add(payload_blob_count.saturating_mul(u64::from(GAS_PER_BLOB)));
+    if blob_gas_used > max_blob_gas_per_block {
+        return Err(InvalidBlockError::ExceededMaxBlobGasPerBlock);
+    }
     if block
         .header
         .blob_gas_used
-        .is_some_and(|header_blob_gas_used| header_blob_gas_used != blob_gas_used as u64)
+        .is_some_and(|header_blob_gas_used| header_blob_gas_used != blob_gas_used)
     {
         return Err(InvalidBlockError::BlobGasUsedMismatch);
     }
@@ -377,10 +382,11 @@ mod tests {
             ..Default::default()
         };
         // Default cancun schedule: max = 6 blobs. No type-3 txs in the body, so
-        // the payload count alone drives the check.
-        let block_with_count = |count| {
+        // the payload count alone drives the check. blob_gas_used must match the
+        // payload blobs (EIP-8142), else the count=6 case fails the gas check first.
+        let block_with_count = |count: u64| {
             let header = BlockHeader {
-                blob_gas_used: Some(0),
+                blob_gas_used: Some(count * u64::from(GAS_PER_BLOB)),
                 excess_blob_gas: Some(0),
                 payload_blob_count: Some(count),
                 ..Default::default()
@@ -391,6 +397,34 @@ mod tests {
         assert!(matches!(
             verify_blob_gas_usage(&block_with_count(7), &config),
             Err(InvalidBlockError::ExceededMaxBlobNumberPerBlock)
+        ));
+    }
+
+    /// EIP-8142: payload blobs consume blob gas, so `blob_gas_used` must equal
+    /// `(type-3 + payload) blobs × GAS_PER_BLOB` — not type-3 alone.
+    #[test]
+    fn verify_blob_gas_usage_includes_payload_blobs() {
+        let config = ChainConfig {
+            cancun_time: Some(0),
+            ..Default::default()
+        };
+        let block_with_gas = |blob_gas_used| {
+            let header = BlockHeader {
+                blob_gas_used: Some(blob_gas_used),
+                excess_blob_gas: Some(0),
+                payload_blob_count: Some(3),
+                ..Default::default()
+            };
+            Block::new(header, BlockBody::default())
+        };
+        // 3 payload blobs, no type-3 tx → blob_gas_used == 3 × GAS_PER_BLOB.
+        assert!(
+            verify_blob_gas_usage(&block_with_gas(3 * u64::from(GAS_PER_BLOB)), &config).is_ok()
+        );
+        // Excluding payload blobs (the old behavior) is now a mismatch.
+        assert!(matches!(
+            verify_blob_gas_usage(&block_with_gas(0), &config),
+            Err(InvalidBlockError::BlobGasUsedMismatch)
         ));
     }
 

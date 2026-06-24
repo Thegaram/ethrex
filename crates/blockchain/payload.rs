@@ -944,6 +944,12 @@ impl Blockchain {
         // Set the new EIP-8142 header field
         context.payload.header.payload_blob_count = Some(payload_blobs.len() as u64);
 
+        // EIP-8142: payload blobs consume blob gas like type-3 blobs, so add them to
+        // blob_gas_used (which also feeds the next block's excess_blob_gas / base fee).
+        let payload_blob_gas = payload_blobs.len() as u64 * u64::from(GAS_PER_BLOB);
+        context.payload.header.blob_gas_used =
+            Some(context.payload.header.blob_gas_used.unwrap_or(0) + payload_blob_gas);
+
         // Hard guarantee against the protocol MAX_BLOBS_PER_BLOCK.
         // Fail here rather than build an invalid block.
         let max_blobs = context.protocol_max_blobs();
