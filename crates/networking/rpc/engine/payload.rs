@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 use crate::rpc::{RpcApiContext, RpcHandler};
 use crate::types::payload::{
     ExecutionPayload, ExecutionPayloadBody, ExecutionPayloadBodyV2, ExecutionPayloadResponse,
-    PayloadStatus,
+    PayloadStatus, PayloadValidationStatus,
 };
 use crate::utils::RpcErr;
 use crate::utils::{RpcRequest, parse_json_hex};
@@ -1448,27 +1448,33 @@ async fn handle_new_payload_v6(
         return Ok(PayloadStatus::invalid_with_err(&err));
     }
 
-    // BAL canonicality: `verify_eip8142_payload` encodes the payload blobs from the *raw*
-    // BAL bytes (keccak == header `block_access_list_hash`). A non-canonical but decodable
-    // BAL is still rejected during execution: the EIP-7928 commitment check rehashes the
-    // *canonical* re-encoding, whose bytes (and thus hash) differ from the raw input, so it
-    // is rejected as INVALID. Consistent with the guest program's explicit re-encode check.
+    let block_hash = block.hash();
+    let parent_hash = block.header.parent_hash;
 
-    // EIP-8142 "block-in-blobs": Verify the payload blob count and the combined versioned hashes.
-    // This replaces V3's type-3-only check.
-    if let Some(status) =
-        verify_eip8142_payload(&block, raw_bal.as_deref(), &expected_blob_versioned_hashes)?
-    {
-        warn!(
-            block = %block.hash(),
-            payload_blob_count = ?block.header.payload_blob_count,
-            reason = status.validation_error.as_deref().unwrap_or("invalid"),
-            "EIP-8142 newPayloadV6 verification rejected block"
-        );
-        return Ok(status);
+    // EIP-8142 "block-in-blobs": validate payload-blob count and versioned hashes.
+    // This is independent of re-execution, so run the two concurrently.
+    let verify = tokio::task::spawn_blocking({
+        let block = block.clone(); // shallow copy; the original is still needed for execution
+        move || verify_eip8142_payload(&block, raw_bal.as_deref(), &expected_blob_versioned_hashes)
+    });
+
+    // Validate block.
+    let status = handle_new_payload_v1_v2(payload, block, context.clone(), bal, make_witness).await;
+
+    if let Some(invalid) = verify.await.map_err(|err| {
+        RpcErr::Internal(format!("payload blob verification task panicked: {err}"))
+    })?? {
+        // Execution stores the block on success; if its blobs are invalid, mark it invalidated.
+        if matches!(&status, Ok(s) if s.status == PayloadValidationStatus::Valid) {
+            context
+                .storage
+                .set_latest_valid_ancestor(block_hash, parent_hash)
+                .await?;
+        }
+        return Ok(invalid);
     }
 
-    handle_new_payload_v1_v2(payload, block, context, bal, make_witness).await
+    status
 }
 
 /// EIP-8142 "block-in-blobs" native payload verification: re-encode payload.
@@ -1483,6 +1489,12 @@ fn verify_eip8142_payload(
     };
     use ethrex_crypto::kzg::blob_to_kzg_commitment;
     use ethrex_metrics::eip8142::METRICS_EIP8142;
+
+    // BAL canonicality: `verify_eip8142_payload` encodes the payload blobs from the *raw*
+    // BAL bytes (keccak == header `block_access_list_hash`). A non-canonical but decodable
+    // BAL is still rejected during execution: the EIP-7928 commitment check rehashes the
+    // *canonical* re-encoding, whose bytes (and thus hash) differ from the raw input, so it
+    // is rejected as INVALID. Consistent with the guest program's explicit re-encode check.
 
     let Some(raw_bal) = raw_bal else {
         return Ok(Some(PayloadStatus::invalid_with_err(
